@@ -1,0 +1,32 @@
+{
+  "watchlist": [
+    "AAPL",
+    "MSFT",
+    "NVDA",
+    "GOOGL",
+    "AMZN",
+    "META",
+    "TSLA",
+    "AVGO",
+    "AMD",
+    "NFLX",
+    "JPM",
+    "V",
+    "MA",
+    "COST",
+    "HD",
+    "UNH",
+    "XOM",
+    "JNJ",
+    "WMT",
+    "PG",
+    "600519",
+    "300750",
+    "000858",
+    "00700",
+    "09988",
+    "03690"
+  ],
+  "interval": 5,
+  "cn_color": true
+}

@@ -1,0 +1,21 @@
+# ============================================================
+# 本项目零第三方依赖，无需 pip 安装任何包。
+#
+# 运行只需 Python 3.x 自带的标准库：
+#   tkinter           图形界面（Windows/macOS 的官方 Python 已内置）
+#   urllib.request    网络请求（腾讯/新浪/东财接口）
+#   json / os / queue / threading / time / webbrowser
+#   concurrent.futures 并发抓取
+#
+# 因此本文件保持为空，直接运行即可：
+#   python stock_monitor.py
+#
+# ------------------------------------------------------------
+# 个别平台注意：
+#   - Linux 若报 ModuleNotFoundError: No module named 'tkinter'，
+#     需用系统包管理器安装 tk（非 pip）：
+#       Debian/Ubuntu : sudo apt install python3-tk
+#       Fedora        : sudo dnf install python3-tkinter
+#       Arch          : sudo pacman -S tk
+#   - Windows/macOS 的 python.org 安装包默认已含 tkinter，无需处理。
+# ============================================================
