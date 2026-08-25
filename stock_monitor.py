@@ -13,6 +13,7 @@ A股 / 港股 / 美股 桌面看盘 + A股选股器 (零依赖: Python 标准库
 """
 
 import json
+import math
 import os
 import queue
 import threading
@@ -301,23 +302,111 @@ def fetch_industry(symbol):
     return result
 
 
-def open_bias_score(close, high, low, liangbi, pct, lo=4.0, hi=5.0):
-    """次日开盘倾向: 返回 (分数, 标签)。分数 -100(低开) ~ +100(高开)。
-    依据: 收盘位置(尾盘强弱)为主, 量比(动能)与涨幅区间位置为辅。"""
-    try:
-        close, high, low = float(close), float(high), float(low)
-    except (TypeError, ValueError):
-        return 0, "中性"
-    rng = high - low
-    pos = (close - low) / rng if rng > 0 else 0.5
-    s1 = (pos - 0.5) * 80
-    lb = float(liangbi) if liangbi is not None else 1.0
-    s2 = max(-15, min(15, (lb - 1.0) * 12))
-    frac = (pct - lo) / (hi - lo) if (pct is not None and hi > lo) else 0.5
-    s3 = (frac - 0.5) * 20
-    score = max(-100, min(100, round(s1 + s2 + s3)))
-    label = "高开" if score >= 15 else ("低开" if score <= -15 else "中性")
-    return score, label
+# ---------------------------------------------------------------------------
+# 开盘倾向: 横截面多因子打分 (量化选股)
+# ---------------------------------------------------------------------------
+# 把原「启发式单指标」升级为「多因子横截面打分」:
+#   1) 每个因子在候选集内做分位排名(0~1), 天然稳健、抗离群值、量纲统一
+#   2) 因子按先验权重线性合成, 权重和为 1, 映射到 0~100
+#   3) 标签用固定阈值(65/35), 对应约前 1/3「高开」/ 后 1/3「低开」
+# 说明: 权重为「先验假设」。本工具离线、无历史数据, 未做 IC/回测估计;
+#       仅作强弱排序参考, 不构成任何预测保证。
+# ---------------------------------------------------------------------------
+
+# 因子权重(和为 1): 尾盘强度 > 量比动能 > 换手/动量 > 成交额规模
+FACTOR_WEIGHTS = {
+    "close_position": 0.35,   # 收盘位置(尾盘强度): (收盘-最低)/(最高-最低)
+    "volume_ratio":   0.25,   # 量比(动能): 当日量能相对 5 日均量的放大
+    "turnover":       0.15,   # 换手率(关注度/流动性)
+    "momentum":       0.15,   # 日内涨跌幅(动量)
+    "amount":         0.10,   # 成交额(资金规模, 取对数)
+}
+
+# 开盘倾向标签阈值(0~100 分)
+BIAS_HIGH = 65
+BIAS_LOW = 35
+
+
+def _f_close_position(row):
+    """收盘位置: (收盘-最低)/(最高-最低), 越接近 1 越强(尾盘强势)。"""
+    high, low, price = row.get("high"), row.get("low"), row.get("price")
+    if high is None or low is None or price is None or high <= low:
+        return None
+    return (price - low) / (high - low)
+
+
+def _f_momentum(row):
+    return row.get("pct")
+
+
+def _f_volume_ratio(row):
+    return row.get("lb")
+
+
+def _f_turnover(row):
+    return row.get("hs")
+
+
+def _f_amount(row):
+    """成交额取对数: 金额重尾分布, 对数压缩后更接近正态, 利于横截面比较。"""
+    a = row.get("amount")
+    if a is None or a <= 0:
+        return None
+    return math.log10(a)
+
+
+_FACTOR_EXTRACTORS = {
+    "close_position": _f_close_position,
+    "volume_ratio": _f_volume_ratio,
+    "turnover": _f_turnover,
+    "momentum": _f_momentum,
+    "amount": _f_amount,
+}
+
+
+def _percentile_rank(values):
+    """横截面分位排名(平均秩法), 返回 [0,1]; 缺失值(None)返回 None。
+    稳健: 不依赖原始量纲, 抗极端值。"""
+    n = len(values)
+    ranked = [None] * n
+    pairs = sorted(((i, v) for i, v in enumerate(values) if v is not None),
+                   key=lambda t: t[1])
+    m = len(pairs)
+    if m == 0:
+        return ranked
+    j = 0
+    while j < m:
+        k = j
+        while k < m and pairs[k][1] == pairs[j][1]:
+            k += 1
+        avg = (j + k - 1) / (2.0 * (m - 1)) if m > 1 else 0.5
+        for idx, _ in pairs[j:k]:
+            ranked[idx] = avg
+        j = k
+    return ranked
+
+
+def open_bias_composite(rows, weights=FACTOR_WEIGHTS):
+    """对候选集做横截面多因子合成, 就地写入每行的 bias(0~100) 与 bias_label。
+
+    流程: 提取原始因子 -> 分位排名 -> 加权求和 -> 缩放 0~100 -> 阈值标签。
+    缺失因子按中性(0.5)处理, 不奖励也不惩罚, 属保守做法。
+    """
+    if not rows:
+        return rows
+    raw = {name: [_FACTOR_EXTRACTORS[name](r) for r in rows] for name in weights}
+    ranks = {name: _percentile_rank(raw[name]) for name in weights}
+    for i, r in enumerate(rows):
+        score = 0.0
+        for name, w in weights.items():
+            rk = ranks[name][i]
+            if rk is None:
+                rk = 0.5
+            score += w * rk
+        score = round(score * 100)
+        r["bias"] = score
+        r["bias_label"] = "高开" if score >= BIAS_HIGH else ("低开" if score <= BIAS_LOW else "中性")
+    return rows
 
 
 def detail_url(mkt, disp):
@@ -327,6 +416,70 @@ def detail_url(mkt, disp):
     if mkt == "hk":
         return f"https://gu.qq.com/hk{disp}"
     return f"https://gu.qq.com/{mkt}{disp}"   # sh / sz / bj
+
+
+# ---------------------------------------------------------------------------
+# 公告消息: 东方财富 A股公告 + 利好/利空关键词标注
+# ---------------------------------------------------------------------------
+
+ANNOUNCE_HDR = {"User-Agent": UA["User-Agent"], "Referer": "https://data.eastmoney.com/"}
+ANNOUNCE_URL = ("https://np-anotice-stock.eastmoney.com/api/security/ann"
+                "?sr=-1&page_size={size}&page_index=1&ann_type=A&client_source=web&stock_list={code}")
+ANNOUNCE_DETAIL = "https://data.eastmoney.com/notices/detail/{code}/{art_code}.html"
+
+# 利好/利空关键词(基于公告标题的启发式判定, 仅供参考; 先判利空再判利好以处理"终止回购"等)
+NEWS_NEGATIVE = (
+    "减持", "预亏", "亏损", "立案", "处罚", "诉讼", "质押", "减值", "退市",
+    "监管", "问询", "警示", "终止", "违约", "解禁", "辞职", "冻结", "调查",
+    "谴责", "责令", "更正", "下调", "风险",
+)
+NEWS_POSITIVE = (
+    "回购", "增持", "中标", "签约", "预增", "扭亏", "分红", "派息", "股权激励",
+    "收购", "重组", "涨价", "获批", "战略合作", "签订", "突破",
+)
+
+_ANNOUNCE_CACHE = {}
+_ANNOUNCE_TTL = 300.0   # 公告静态, 缓存 5 分钟
+
+# 自选盯盘表可点击排序的数值列
+WATCH_NUMERIC_COLS = ("price", "change", "pct", "open", "high", "low", "prev", "volume")
+
+
+def classify_announcement(title):
+    """按公告标题关键词标注影响: 利好 / 利空 / 中性。启发式, 仅作参考。"""
+    t = title or ""
+    for kw in NEWS_NEGATIVE:
+        if kw in t:
+            return "利空"
+    for kw in NEWS_POSITIVE:
+        if kw in t:
+            return "利好"
+    return "中性"
+
+
+def fetch_announcements(code, size=60):
+    """东财 A股公告: 返回 list[dict(date, title, art_code, impact)], 带 TTL 缓存。
+    code 为 6 位数字 A股代码(如 600519)。"""
+    now = time.time()
+    hit = _ANNOUNCE_CACHE.get(code)
+    if hit and now - hit[0] < _ANNOUNCE_TTL:
+        return hit[1]
+    out = []
+    try:
+        data = json.loads(_http(ANNOUNCE_URL.format(size=size, code=code),
+                                ANNOUNCE_HDR, timeout=8).decode("utf-8", "replace"))
+        for it in (data.get("data") or {}).get("list") or []:
+            title = it.get("title") or ""
+            out.append({
+                "date": (it.get("notice_date") or "")[:10],
+                "title": title,
+                "art_code": it.get("art_code") or "",
+                "impact": classify_announcement(title),
+            })
+    except Exception:
+        pass
+    _ANNOUNCE_CACHE[code] = (now, out)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -355,6 +508,14 @@ class StockMonitorApp:
         self.screen_rows = []        # 过滤+排序后的完整结果
         self.screen_page = 0
         self.screen_page_size = 50
+
+        # 自选盯盘排序状态
+        self.watch_sort_col = None
+        self.watch_sort_desc = False
+
+        # 选股器排序状态(表头点击)
+        self.screen_sort_col = None
+        self.screen_sort_desc = False
 
         self._load_config()
         self._build_ui()
@@ -443,11 +604,13 @@ class StockMonitorApp:
         headers = ("市场", "代码", "名称", "现价", "涨跌", "涨跌幅", "开盘", "最高", "最低",
                    "昨收", "成交量", "更新时间")
         widths = (52, 80, 120, 88, 88, 88, 88, 88, 88, 88, 96, 150)
+        self.watch_cols = cols
+        self.watch_headers = dict(zip(cols, headers))
         tf = ttk.Frame(self.tab_watch, padding=(8, 4))
         tf.pack(fill="both", expand=True)
         self.tree = ttk.Treeview(tf, columns=cols, show="headings")
         for c, h, w in zip(cols, headers, widths):
-            self.tree.heading(c, text=h)
+            self.tree.heading(c, text=h, command=lambda col=c: self._sort_watch(col))
             self.tree.column(c, width=w, anchor="e")
         for c in ("name", "code", "mkt"):
             self.tree.column(c, anchor="w")
@@ -460,6 +623,7 @@ class StockMonitorApp:
         self.tree.tag_configure("down", foreground=COLOR_DOWN_DEFAULT)
         self.tree.tag_configure("flat", foreground=COLOR_FLAT)
         self.tree.bind("<Double-1>", self._open_detail)
+        self.tree.bind("<Button-3>", self._on_watch_right_click)
 
         self.status_var = tk.StringVar(value="加载中...")
         ttk.Label(self.tab_watch, textvariable=self.status_var, anchor="w",
@@ -544,6 +708,8 @@ class StockMonitorApp:
         self.tree.delete(*self.tree.get_children())
         with self._lock:
             syms = list(self.watchlist)
+        if self.watch_sort_col:
+            syms = self._sorted_watch(syms)
         for sym in syms:
             entry = self.stock_results.get(sym)
             c = classify_symbol(sym)
@@ -681,11 +847,13 @@ class StockMonitorApp:
         cols = ("code", "name", "industry", "price", "pct", "lb", "hs", "amount", "volume", "bias")
         headers = ("代码", "名称", "行业", "现价", "涨跌幅", "量比", "换手率", "成交额", "成交量", "开盘倾向")
         widths = (76, 108, 92, 84, 84, 66, 76, 92, 92, 96)
+        self.screen_cols = cols
+        self.screen_headers = dict(zip(cols, headers))
         tf = ttk.Frame(self.tab_screen, padding=(8, 4))
         tf.pack(fill="both", expand=True)
         self.stree = ttk.Treeview(tf, columns=cols, show="headings")
         for c, h, w in zip(cols, headers, widths):
-            self.stree.heading(c, text=h)
+            self.stree.heading(c, text=h, command=lambda col=c: self._sort_screen(col))
             self.stree.column(c, width=w, anchor="e")
         self.stree.column("name", anchor="w")
         self.stree.column("code", anchor="w")
@@ -698,6 +866,7 @@ class StockMonitorApp:
         self.stree.tag_configure("down", foreground=COLOR_DOWN_DEFAULT)
         self.stree.tag_configure("flat", foreground=COLOR_FLAT)
         self.stree.bind("<Double-1>", self._open_screen_detail)
+        self.stree.bind("<Button-3>", self._on_screen_right_click)
 
         # 分页栏
         pg = ttk.Frame(self.tab_screen, padding=(8, 4))
@@ -757,32 +926,27 @@ class StockMonitorApp:
                 if cands:
                     with ThreadPoolExecutor(max_workers=24) as ex:
                         cands = list(ex.map(enrich, cands))
-                # 组装行 + 立即算开盘倾向(不需要行业), 先交付结果
+                # 组装行(含全部原始因子字段), 暂不填开盘倾向
                 rows = []
                 for r in cands:
                     lb = to_float(r.get("lb")) or 0.0
                     if lb < lb_min:
                         continue
-                    pct = to_float(r.get("changepercent"))
-                    score, label = open_bias_score(to_float(r.get("trade")),
-                                                   to_float(r.get("high")),
-                                                   to_float(r.get("low")),
-                                                   to_float(r.get("lb")), pct, f_min, f_max)
                     rows.append({
                         "code": r.get("code"), "name": r.get("name"),
                         "symbol": r.get("symbol"),
                         "price": to_float(r.get("trade")),
-                        "pct": pct,
-                        "lb": to_float(r.get("lb")),
+                        "pct": to_float(r.get("changepercent")),
+                        "lb": lb,
                         "hs": to_float(r.get("turnoverratio")),
                         "amount": to_float(r.get("amount"), 0),
                         "volume": to_float(r.get("volume"), 0),
                         "high": to_float(r.get("high")),
                         "low": to_float(r.get("low")),
                         "industry": "…",
-                        "bias": score,
-                        "bias_label": label,
                     })
+                # 横截面多因子合成开盘倾向(分位排名 + 加权, 0~100)
+                open_bias_composite(rows)
                 sort_key = {"量比": "lb", "换手率": "hs", "涨跌幅": "pct",
                             "成交额": "amount", "开盘倾向": "bias"}
                 key = sort_key.get(self.sort_var.get(), "lb")
@@ -805,6 +969,8 @@ class StockMonitorApp:
 
     def _deliver(self, rows, final):
         self.screen_rows = rows
+        if self.screen_sort_col:
+            self._apply_screen_sort()
         self.screen_page = 0
         self._render_screen_table()
         if final:
@@ -830,7 +996,7 @@ class StockMonitorApp:
             label = r.get("bias_label") or "中性"
             tag = "up" if label == "高开" else ("down" if label == "低开" else "flat")
             score = r.get("bias")
-            bias_text = "--" if score is None else f"{label} {score:+d}"
+            bias_text = "--" if score is None else f"{label} {score:d}"
             vals = (
                 r["code"],
                 r["name"] or "",
@@ -845,6 +1011,41 @@ class StockMonitorApp:
             )
             self.stree.insert("", "end", values=vals, tags=(tag,))
         self.page_var.set(f"第 {self.screen_page + 1} / {pages} 页")
+
+    def _screen_sort_value(self, r, col):
+        """选股器行某列的可排序值; None 表示缺失(排最后)。"""
+        if col in ("price", "pct", "lb", "hs", "amount", "volume", "bias"):
+            return r.get(col)
+        return r.get(col) or ""
+
+    def _apply_screen_sort(self):
+        col = self.screen_sort_col
+        if not col or not self.screen_rows:
+            return
+        keyed = [(self._screen_sort_value(r, col), r) for r in self.screen_rows]
+        present = [(v, r) for v, r in keyed if v is not None]
+        missing = [r for v, r in keyed if v is None]
+        present.sort(key=lambda t: t[0], reverse=self.screen_sort_desc)
+        self.screen_rows = [r for _v, r in present] + missing
+
+    def _update_screen_headings(self):
+        for c in self.screen_cols:
+            base = self.screen_headers[c]
+            if c == self.screen_sort_col:
+                self.stree.heading(c, text=base + (" ▼" if self.screen_sort_desc else " ▲"))
+            else:
+                self.stree.heading(c, text=base)
+
+    def _sort_screen(self, col):
+        if self.screen_sort_col == col:
+            self.screen_sort_desc = not self.screen_sort_desc
+        else:
+            self.screen_sort_col = col
+            self.screen_sort_desc = False
+        self._apply_screen_sort()
+        self.screen_page = 0
+        self._update_screen_headings()
+        self._render_screen_table()
 
     def _screen_prev(self):
         if self.screen_page > 0:
@@ -885,6 +1086,190 @@ class StockMonitorApp:
                 sym = r.get("symbol", "")
                 break
         webbrowser.open(f"https://gu.qq.com/{sym}" if sym else f"https://gu.qq.com/{code}")
+
+    # ---------------- 排序(自选盯盘表头) ----------------
+    def _sort_watch(self, col):
+        if self.watch_sort_col == col:
+            self.watch_sort_desc = not self.watch_sort_desc
+        else:
+            self.watch_sort_col = col
+            self.watch_sort_desc = False
+        self._update_watch_headings()
+        self._render_table()
+
+    def _watch_sort_value(self, sym, col):
+        """返回该列可排序值; None 表示缺失(固定排最后)。"""
+        entry = self.stock_results.get(sym)
+        if not entry or entry[0] is None:
+            return None
+        d = entry[0]
+        if col in WATCH_NUMERIC_COLS:
+            return d.get(col)
+        if col == "code":
+            return sym
+        if col == "name":
+            return d.get("name") or None
+        if col == "mkt":
+            c = classify_symbol(sym)
+            return c[2] if c else None
+        if col == "time":
+            return d.get("time") or None
+        return None
+
+    def _sorted_watch(self, syms):
+        col = self.watch_sort_col
+        desc = self.watch_sort_desc
+        vals = {s: self._watch_sort_value(s, col) for s in syms}
+        present = [(s, vals[s]) for s in syms if vals[s] is not None]
+        missing = [s for s in syms if vals[s] is None]
+        present.sort(key=lambda t: t[1], reverse=desc)
+        return [s for s, _v in present] + missing
+
+    def _update_watch_headings(self):
+        for c in self.watch_cols:
+            base = self.watch_headers[c]
+            if c == self.watch_sort_col:
+                self.tree.heading(c, text=base + (" ▼" if self.watch_sort_desc else " ▲"))
+            else:
+                self.tree.heading(c, text=base)
+
+    # ---------------- 右键菜单: 复制代码 / 公告消息 ----------------
+    def _copy_code(self, code):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(code)
+        self.root.update()
+
+    def _show_context_menu(self, event, code):
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label=f"复制代码 {code}", command=lambda: self._copy_code(code))
+        c = classify_symbol(code)
+        mkt = c[2] if c else ""
+        if mkt in ("sh", "sz", "bj"):
+            menu.add_command(label="查看公告消息", command=lambda: self._open_news(code))
+        self._popup = menu
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _on_watch_right_click(self, event):
+        row = self.tree.identify_row(event.y)
+        if not row:
+            return
+        self.tree.selection_set(row)
+        code = self.tree.item(row, "values")[1]
+        self._show_context_menu(event, code)
+
+    def _on_screen_right_click(self, event):
+        row = self.stree.identify_row(event.y)
+        if not row:
+            return
+        self.stree.selection_set(row)
+        code = self.stree.item(row, "values")[0]
+        self._show_context_menu(event, code)
+
+    # ---------------- 公告消息弹窗 ----------------
+    def _open_news(self, code):
+        c = classify_symbol(code)
+        mkt = c[2] if c else ""
+        if mkt not in ("sh", "sz", "bj"):
+            messagebox.showinfo("提示", "公告消息当前仅支持 A股。\n"
+                                "(数据源为东方财富, 港股/美股无对应公告)")
+            return
+        disp = c[1]
+
+        win = tk.Toplevel(self.root)
+        win.title(f"公告消息 - {disp}")
+        win.geometry("760x540")
+        win.transient(self.root)
+
+        hdr = ttk.Frame(win, padding=(8, 6))
+        hdr.pack(fill="x")
+        ttk.Label(hdr, text=f"{disp} 基本面公告 · 利好/利空为关键词启发式标注",
+                  font=("Microsoft YaHei", 10, "bold")).pack(side="left")
+        status = tk.StringVar(value="加载中...")
+        ttk.Label(hdr, textvariable=status, foreground="#666").pack(side="right")
+
+        tf = ttk.Frame(win, padding=(8, 4))
+        tf.pack(fill="both", expand=True)
+        cols = ("date", "impact", "title", "art")
+        headers = {"date": "日期", "impact": "影响", "title": "公告标题"}
+        tree = ttk.Treeview(tf, columns=cols, show="headings")
+        for c in ("date", "impact", "title"):
+            tree.heading(c, text=headers[c], command=lambda col=c: sort(col))
+        tree.column("date", width=90, anchor="center")
+        tree.column("impact", width=56, anchor="center")
+        tree.column("title", width=580, anchor="w")
+        tree.column("art", width=0, stretch=False)
+        vsb = ttk.Scrollbar(tf, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        tree.tag_configure("利好", foreground=COLOR_UP_DEFAULT)
+        tree.tag_configure("利空", foreground=COLOR_DOWN_DEFAULT)
+        tree.tag_configure("中性", foreground=COLOR_FLAT)
+        tree.bind("<Double-1>", lambda e: self._open_announce_detail(tree, disp))
+
+        holder = {"rows": []}
+        sort_state = {"col": None, "desc": False}
+        impact_order = {"利好": 0, "中性": 1, "利空": 2}
+
+        def sort_value(r, col):
+            if col == "date":
+                return r["date"]
+            if col == "impact":
+                return impact_order.get(r["impact"], 1)
+            return r["title"]
+
+        def render():
+            tree.delete(*tree.get_children())
+            for r in holder["rows"]:
+                tree.insert("", "end",
+                            values=(r["date"], r["impact"], r["title"], r["art_code"]),
+                            tags=(r["impact"],))
+
+        def sort(col):
+            if sort_state["col"] == col:
+                sort_state["desc"] = not sort_state["desc"]
+            else:
+                sort_state["col"] = col
+                sort_state["desc"] = False
+            holder["rows"].sort(key=lambda r: sort_value(r, sort_state["col"]),
+                                reverse=sort_state["desc"])
+            render()
+            for c in ("date", "impact", "title"):
+                mark = ""
+                if sort_state["col"] == c:
+                    mark = " ▼" if sort_state["desc"] else " ▲"
+                tree.heading(c, text=headers[c] + mark)
+
+        def work():
+            try:
+                rows = fetch_announcements(disp)
+                err = None
+            except Exception as ex:
+                rows, err = [], str(ex)
+
+            def update_ui():
+                if err:
+                    status.set(f"加载失败: {err}")
+                    return
+                holder["rows"] = rows
+                render()
+                n_pos = sum(1 for r in rows if r["impact"] == "利好")
+                n_neg = sum(1 for r in rows if r["impact"] == "利空")
+                status.set(f"共 {len(rows)} 条 · 利好 {n_pos} · 利空 {n_neg} · 双击查看详情")
+            win.after(0, update_ui)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _open_announce_detail(self, tree, code):
+        sel = tree.selection()
+        if not sel:
+            return
+        art = tree.item(sel[0], "values")[3]
+        if art:
+            webbrowser.open(ANNOUNCE_DETAIL.format(code=code, art_code=art))
 
     # ---------------- 关闭 ----------------
     def _on_close(self):
