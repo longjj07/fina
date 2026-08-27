@@ -6,6 +6,8 @@ A股 / 港股 / 美股 桌面看盘 + A股选股器 (零依赖: Python 标准库
 数据源:
   - 自选股 / 指数: 腾讯财经 qt.gtimg.cn        (前缀 us / sh / sz / bj / hk)
   - 选股器:        新浪 A股全市场列表 (涨跌幅+换手率) + 腾讯单只补齐量比
+  - 历史日K:       腾讯 web.ifzq.gtimg.cn (昨日涨幅对比 / 连涨 / 昨日量能)
+  - 24h消息面:     东财个股资讯(np-listapi, 三市场) + 新浪 7x24 全球快讯
 均为免费、免密钥、大陆可直连。行情为延时行情(美股/港股约15分钟, A股盘中约3秒), 仅供监控参考,
 不构成任何投资建议。
 
@@ -152,6 +154,7 @@ def parse_tencent(text):
         ts = f"{ts[:4]}-{ts[4:6]}-{ts[6:8]} {ts[8:10]}:{ts[10:12]}:{ts[12:14]}"
     return {
         "name": p[1].strip(),
+        "qt_code": p[2].strip(),       # 美股为带后缀完整代码(如 AAPL.OQ), 其余为数字代码
         "price": price,
         "change": change,
         "pct": pct,
@@ -260,6 +263,107 @@ def fetch_a_metrics(symbol):
         return None, None
 
 
+# ---------------------------------------------------------------------------
+# 历史日K(腾讯 ifzq): 当日 vs 昨日 涨幅对比 + 时间序列因子
+# ---------------------------------------------------------------------------
+
+KLINE_URL = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={sym},day,,,{n},qfq"
+KLINE_HDR = {"User-Agent": UA["User-Agent"], "Referer": "https://gu.qq.com/"}
+
+_KLINE_CACHE = {}       # symbol -> 昨日指标 dict(当日有效)
+_KLINE_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kline_cache.json")
+_KLINE_FAIL_TS = {}     # symbol -> 上次失败时间(负缓存, 避免反复重试打爆接口)
+_KLINE_FAIL_TTL = 600.0
+
+
+def _kline_today_ref(mkt):
+    """判定日K最后一根是否为「当日」bar 的参照日期。
+    美股交易日比北京日期晚约1天(收盘在北京凌晨), 以本地日期-36h 作参照。"""
+    if mkt == "us":
+        return time.strftime("%Y-%m-%d", time.localtime(time.time() - 36 * 3600))
+    return time.strftime("%Y-%m-%d")
+
+
+def fetch_daily_kline(symbol, n=12):
+    """腾讯日K(前复权): 返回 list[dict(date,open,close,high,low,volume)] 旧->新, 失败返回 []。
+    A股/港股直接用 sh/sz/bj/hk 前缀代码; 美股需带交易所后缀(如 usAAPL.OQ)。"""
+    try:
+        raw = _http(KLINE_URL.format(sym=symbol, n=n), KLINE_HDR, timeout=8).decode("utf-8", "replace")
+        node = (json.loads(raw).get("data") or {}).get(symbol) or {}
+        arr = node.get("qfqday") or node.get("day") or []
+        out = []
+        for b in arr:
+            if isinstance(b, (list, tuple)) and len(b) >= 6:
+                out.append({"date": str(b[0]), "open": to_float(b[1]), "close": to_float(b[2]),
+                            "high": to_float(b[3]), "low": to_float(b[4]), "volume": to_float(b[5], 0)})
+        return out
+    except Exception:
+        return []
+
+
+def derive_prev_metrics(bars, today_ref):
+    """从日K(旧->新)提取「昨日」截面指标(当日未定型 bar 不参与):
+    p=昨日涨幅%  s=截至昨日连涨天数  vr=昨日量/前5日均量。数据不足返回 None。"""
+    hist = [b for b in bars if b.get("close")]
+    if hist and hist[-1]["date"][:10] == today_ref:
+        hist = hist[:-1]                      # 剔除当日(盘中未定型)bar
+    if len(hist) < 2:
+        return None
+    prev, prev2 = hist[-1], hist[-2]
+    m = {"p": round((prev["close"] / prev2["close"] - 1) * 100, 2)}
+    streak = 0                                # 截至昨日的连涨天数
+    for i in range(len(hist) - 1, 0, -1):
+        if hist[i]["close"] > hist[i - 1]["close"]:
+            streak += 1
+        else:
+            break
+    m["s"] = streak
+    vols = [b["volume"] for b in hist[-6:-1] if b.get("volume")]
+    if len(vols) == 5 and prev.get("volume"):
+        avg = sum(vols) / 5.0
+        if avg > 0:
+            m["vr"] = round(prev["volume"] / avg, 2)
+    return m
+
+
+def fetch_prev_metrics(symbol):
+    """带缓存的昨日指标(当日有效, 内存+磁盘), 失败负缓存 10 分钟。
+    symbol 形如 sh600519 / hk00700 / usAAPL.OQ。"""
+    if symbol in _KLINE_CACHE:
+        return _KLINE_CACHE[symbol]
+    fail = _KLINE_FAIL_TS.get(symbol)
+    if fail and time.time() - fail < _KLINE_FAIL_TTL:
+        return None
+    m = derive_prev_metrics(fetch_daily_kline(symbol), _kline_today_ref(symbol[:2]))
+    if m is None:
+        _KLINE_FAIL_TS[symbol] = time.time()
+        return None
+    _KLINE_CACHE[symbol] = m
+    return m
+
+
+def _load_kline_cache():
+    try:
+        with open(_KLINE_CACHE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if data.get("_saved") == time.strftime("%Y-%m-%d"):
+            for k, v in data.items():
+                if not k.startswith("_") and isinstance(v, dict):
+                    _KLINE_CACHE[k] = v
+    except Exception:
+        pass
+
+
+def _save_kline_cache():
+    try:
+        data = {"_saved": time.strftime("%Y-%m-%d")}
+        data.update(_KLINE_CACHE)
+        with open(_KLINE_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
 _INDUSTRY_CACHE = {}
 _INDUSTRY_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "industry_cache.json")
 
@@ -309,17 +413,25 @@ def fetch_industry(symbol):
 #   1) 每个因子在候选集内做分位排名(0~1), 天然稳健、抗离群值、量纲统一
 #   2) 因子按先验权重线性合成, 权重和为 1, 映射到 0~100
 #   3) 标签用固定阈值(65/35), 对应约前 1/3「高开」/ 后 1/3「低开」
+# 因子分三类:
+#   - 时间序列因子(当日 vs 昨日, 来自日K): 动量加速度(涨幅差)、连涨天数、昨日量能
+#   - 当日截面因子(实时快照): 尾盘强度、量比、换手、成交额、日内动量
+#   - 消息面因子(近24h资讯): 利好/利空条数差
 # 说明: 权重为「先验假设」。本工具离线、无历史数据, 未做 IC/回测估计;
 #       仅作强弱排序参考, 不构成任何预测保证。
 # ---------------------------------------------------------------------------
 
-# 因子权重(和为 1): 尾盘强度 > 量比动能 > 换手/动量 > 成交额规模
+# 因子权重(和为 1): 涨幅加速 > 消息面/尾盘强度 > 量比/连涨/昨日量能/换手 > 成交额/当日动量
 FACTOR_WEIGHTS = {
-    "close_position": 0.35,   # 收盘位置(尾盘强度): (收盘-最低)/(最高-最低)
-    "volume_ratio":   0.25,   # 量比(动能): 当日量能相对 5 日均量的放大
-    "turnover":       0.15,   # 换手率(关注度/流动性)
-    "momentum":       0.15,   # 日内涨跌幅(动量)
-    "amount":         0.10,   # 成交额(资金规模, 取对数)
+    "accel":          0.20,   # 动量加速度(核心): 今日涨幅 - 昨日涨幅, >0 为动能增强
+    "news":           0.15,   # 24h消息面: 利好条数 - 利空条数(关键词启发式)
+    "close_position": 0.15,   # 收盘位置(尾盘强度): (收盘-最低)/(最高-最低)
+    "volume_ratio":   0.10,   # 量比(动能): 当日量能相对 5 日均量的放大
+    "up_streak":      0.10,   # 连涨天数(含今日): 趋势持续性
+    "vol_prev_ratio": 0.10,   # 昨日量/前5日均量: 前日资金介入度
+    "turnover":       0.10,   # 换手率(关注度/流动性)
+    "amount":         0.05,   # 成交额(资金规模, 取对数)
+    "momentum":       0.05,   # 当日涨跌幅(筛选区间窄, 区分度低)
 }
 
 # 开盘倾向标签阈值(0~100 分)
@@ -339,6 +451,26 @@ def _f_momentum(row):
     return row.get("pct")
 
 
+def _f_accel(row):
+    """动量加速度: 今日涨幅 - 昨日涨幅(百分点)。>0 = 涨幅扩大或跌幅收窄(动能增强)。"""
+    return row.get("delta")
+
+
+def _f_up_streak(row):
+    """连涨天数(含今日): 趋势持续性。今日下跌则为 0。"""
+    return row.get("streak")
+
+
+def _f_vol_prev_ratio(row):
+    """昨日量/前5日均量: 今日启动前一日是否已有资金放量介入。"""
+    return row.get("vr")
+
+
+def _f_news(row):
+    """24h消息面得分: 利好条数 - 利空条数(关键词启发式)。>0 = 近24h偏利好。"""
+    return row.get("news_score")
+
+
 def _f_volume_ratio(row):
     return row.get("lb")
 
@@ -356,6 +488,10 @@ def _f_amount(row):
 
 
 _FACTOR_EXTRACTORS = {
+    "accel": _f_accel,
+    "up_streak": _f_up_streak,
+    "vol_prev_ratio": _f_vol_prev_ratio,
+    "news": _f_news,
     "close_position": _f_close_position,
     "volume_ratio": _f_volume_ratio,
     "turnover": _f_turnover,
@@ -427,22 +563,23 @@ ANNOUNCE_URL = ("https://np-anotice-stock.eastmoney.com/api/security/ann"
                 "?sr=-1&page_size={size}&page_index=1&ann_type=A&client_source=web&stock_list={code}")
 ANNOUNCE_DETAIL = "https://data.eastmoney.com/notices/detail/{code}/{art_code}.html"
 
-# 利好/利空关键词(基于公告标题的启发式判定, 仅供参考; 先判利空再判利好以处理"终止回购"等)
+# 利好/利空关键词(基于公告/资讯标题的启发式判定, 仅供参考; 先判利空再判利好以处理"终止回购"等)
 NEWS_NEGATIVE = (
     "减持", "预亏", "亏损", "立案", "处罚", "诉讼", "质押", "减值", "退市",
     "监管", "问询", "警示", "终止", "违约", "解禁", "辞职", "冻结", "调查",
-    "谴责", "责令", "更正", "下调", "风险",
+    "谴责", "责令", "更正", "下调", "风险", "不及预期", "闪崩", "暴跌", "停产",
 )
 NEWS_POSITIVE = (
     "回购", "增持", "中标", "签约", "预增", "扭亏", "分红", "派息", "股权激励",
-    "收购", "重组", "涨价", "获批", "战略合作", "签订", "突破",
+    "收购", "重组", "涨价", "获批", "战略合作", "签订", "突破", "超预期", "新高", "强劲",
 )
 
 _ANNOUNCE_CACHE = {}
 _ANNOUNCE_TTL = 300.0   # 公告静态, 缓存 5 分钟
 
 # 自选盯盘表可点击排序的数值列
-WATCH_NUMERIC_COLS = ("price", "change", "pct", "open", "high", "low", "prev", "volume")
+WATCH_NUMERIC_COLS = ("price", "change", "pct", "pct_prev", "delta", "open", "high", "low",
+                      "prev", "volume")
 
 
 def classify_announcement(title):
@@ -483,6 +620,114 @@ def fetch_announcements(code, size=60):
 
 
 # ---------------------------------------------------------------------------
+# 24小时消息面: 东方财富个股资讯(三市场) + 利好/利空标注
+# ---------------------------------------------------------------------------
+
+NEWS_LIST_HDR = {"User-Agent": UA["User-Agent"], "Referer": "https://quote.eastmoney.com/"}
+NEWS_LIST_URL = ("https://np-listapi.eastmoney.com/comm/web/getListInfo"
+                 "?client=web&mTypeAndCode={code}&type=1&pageSize={size}&pageIndex=1")
+NEWS_WINDOW_H = 24.0        # 消息面时间窗(小时)
+
+_STOCK_NEWS_CACHE = {}      # em_code -> (ts, items24h, stats)
+_STOCK_NEWS_TTL = 600.0     # 资讯列表缓存 10 分钟
+
+
+def em_news_code(mkt, disp, qt_code=""):
+    """东财个股资讯的市场代码: 1=沪 0=深/北 116=港 105/106/107=美股(按交易所)。
+    美股交易所从行情完整代码后缀判断(.OQ纳斯达克/.N纽交所/.A美交所)。"""
+    if mkt == "sh":
+        return "1." + disp
+    if mkt == "hk":
+        return "116." + disp
+    if mkt == "us":
+        suf = (qt_code or "").upper()
+        if suf.endswith(".N"):
+            return "106." + disp
+        if suf.endswith(".A"):
+            return "107." + disp
+        return "105." + disp
+    return "0." + disp                     # sz / bj
+
+
+def _parse_dt(s):
+    """'2026-08-27 14:07:28' -> 本地时间戳; 解析失败返回 None。"""
+    try:
+        return time.mktime(time.strptime(s, "%Y-%m-%d %H:%M:%S"))
+    except (TypeError, ValueError):
+        return None
+
+
+def fetch_stock_news(mkt, disp, qt_code="", size=40):
+    """东财个股资讯: 取最近 size 条, 过滤出近 24h 内条目并标注利好/利空。
+    返回 (items24h, stats): items=[{time,title,url,impact}], stats={n_pos,n_neg}。带 10 分钟 TTL 缓存。"""
+    key = em_news_code(mkt, disp, qt_code)
+    now = time.time()
+    hit = _STOCK_NEWS_CACHE.get(key)
+    if hit and now - hit[0] < _STOCK_NEWS_TTL:
+        return hit[1], hit[2]
+    items = []
+    stats = {"n_pos": 0, "n_neg": 0}
+    try:
+        data = json.loads(_http(NEWS_LIST_URL.format(code=key, size=size),
+                                NEWS_LIST_HDR, timeout=8).decode("utf-8", "replace"))
+        for it in (data.get("data") or {}).get("list") or []:
+            t = str(it.get("Art_ShowTime") or "")[:19]
+            ts = _parse_dt(t)
+            if ts is None or not (0 <= now - ts <= NEWS_WINDOW_H * 3600):
+                continue
+            impact = classify_announcement(it.get("Art_Title") or "")
+            if impact == "利好":
+                stats["n_pos"] += 1
+            elif impact == "利空":
+                stats["n_neg"] += 1
+            items.append({"time": t[5:16], "title": it.get("Art_Title") or "",
+                          "url": it.get("Art_Url") or "", "impact": impact})
+    except Exception:
+        pass
+    _STOCK_NEWS_CACHE[key] = (now, items, stats)
+    return items, stats
+
+
+# ---------------------------------------------------------------------------
+# 7x24 全球快讯: 新浪财经直播
+# ---------------------------------------------------------------------------
+
+ZB_URL = ("https://zhibo.sina.com.cn/api/zhibo/feed?page=1&page_size={n}"
+          "&zhibo_id=152&tag_id=0&dire=f&dpc=1")
+ZB_HDR = {"User-Agent": UA["User-Agent"], "Referer": "https://finance.sina.com.cn/7x24/"}
+
+
+def fetch_flash_news(n=50):
+    """新浪 7x24 财经快讯(最新 n 条, 新->旧): list[dict(time,text,impact,url)]。失败返回 []。"""
+    try:
+        raw = _http(ZB_URL.format(n=n), ZB_HDR, timeout=8).decode("utf-8", "replace")
+        feed = ((json.loads(raw).get("result") or {}).get("data") or {}).get("feed") or {}
+        out = []
+        for it in feed.get("list") or []:
+            text = (it.get("rich_text") or "").strip()
+            if not text:
+                continue
+            out.append({"time": str(it.get("create_time") or "")[5:16],
+                        "text": text, "url": it.get("docurl") or "",
+                        "impact": classify_announcement(text)})
+        return out
+    except Exception:
+        return []
+
+
+def fmt_news(r):
+    """选股器「24h消息」列: 利好N·利空M / 无 / --。"""
+    p, n = r.get("news_pos"), r.get("news_neg")
+    if p is None and n is None:
+        return "--"
+    if not p and not n:
+        return "无"
+    if p and n:
+        return f"利好{p}·利空{n}"
+    return f"利好{p}" if p else f"利空{n}"
+
+
+# ---------------------------------------------------------------------------
 # 主窗口
 # ---------------------------------------------------------------------------
 
@@ -490,7 +735,7 @@ class StockMonitorApp:
     def __init__(self, root):
         self.root = root
         root.title("A股·港股·美股 行情监控 + 选股器 (延时行情)")
-        root.geometry("1280x720")
+        root.geometry("1420x760")
 
         self._stop = False
         self._queue = queue.Queue()
@@ -557,10 +802,13 @@ class StockMonitorApp:
         nb.pack(fill="both", expand=True)
         self.tab_watch = ttk.Frame(nb)
         self.tab_screen = ttk.Frame(nb)
+        self.tab_feed = ttk.Frame(nb)
         nb.add(self.tab_watch, text="  自选盯盘  ")
         nb.add(self.tab_screen, text="  选股器(A股)  ")
+        nb.add(self.tab_feed, text="  7x24快讯  ")
         self._build_watch_tab()
         self._build_screen_tab()
+        self._build_feed_tab()
 
     # ================ 自选盯盘 ================
     def _build_watch_tab(self):
@@ -599,11 +847,11 @@ class StockMonitorApp:
                         command=self._toggle_color).pack(side="left", padx=10)
 
         # 表格
-        cols = ("mkt", "code", "name", "price", "change", "pct", "open", "high", "low",
-                "prev", "volume", "time")
-        headers = ("市场", "代码", "名称", "现价", "涨跌", "涨跌幅", "开盘", "最高", "最低",
-                   "昨收", "成交量", "更新时间")
-        widths = (52, 80, 120, 88, 88, 88, 88, 88, 88, 88, 96, 150)
+        cols = ("mkt", "code", "name", "price", "change", "pct", "pct_prev", "delta",
+                "open", "high", "low", "prev", "volume", "time")
+        headers = ("市场", "代码", "名称", "现价", "涨跌", "涨跌幅", "昨涨幅", "涨幅差",
+                   "开盘", "最高", "最低", "昨收", "成交量", "更新时间")
+        widths = (48, 76, 112, 82, 82, 82, 76, 76, 78, 78, 78, 78, 90, 140)
         self.watch_cols = cols
         self.watch_headers = dict(zip(cols, headers))
         tf = ttk.Frame(self.tab_watch, padding=(8, 4))
@@ -654,7 +902,14 @@ class StockMonitorApp:
             tcode, disp, mkt = c
             try:
                 raw = _http("https://qt.gtimg.cn/q=" + tcode, UA).decode("gbk", "replace")
-                return sym, parse_tencent(raw), mkt
+                data = parse_tencent(raw)
+                # 昨日对比指标(带当日缓存); 美股日K需带交易所后缀(如 usAAPL.OQ)
+                ksym = ("us" + data["qt_code"]) if (mkt == "us" and data.get("qt_code")) else tcode
+                m = fetch_prev_metrics(ksym)
+                if m and m.get("p") is not None and data.get("pct") is not None:
+                    data["pct_prev"] = m["p"]
+                    data["delta"] = round(data["pct"] - m["p"], 2)
+                return sym, data, mkt
             except Exception:
                 return sym, None, mkt
 
@@ -729,6 +984,8 @@ class StockMonitorApp:
                 fmt_price(d.get("price")),
                 fmt_signed(d.get("change")),
                 fmt_pct(d.get("pct")),
+                fmt_pct(d.get("pct_prev")),
+                fmt_pct(d.get("delta")),
                 fmt_price(d.get("open")),
                 fmt_price(d.get("high")),
                 fmt_price(d.get("low")),
@@ -835,7 +1092,8 @@ class StockMonitorApp:
         ttk.Label(top, text="  排序:").pack(side="left")
         self.sort_var = tk.StringVar(value="量比")
         ttk.Combobox(top, textvariable=self.sort_var, width=8, state="readonly",
-                     values=("量比", "换手率", "涨跌幅", "成交额", "开盘倾向")).pack(side="left", padx=2)
+                     values=("量比", "换手率", "涨跌幅", "昨涨幅", "涨幅差", "连涨",
+                             "24h消息", "成交额", "开盘倾向")).pack(side="left", padx=2)
 
         self.screen_btn = ttk.Button(top, text="查询", command=self._run_screen)
         self.screen_btn.pack(side="left", padx=6)
@@ -843,10 +1101,32 @@ class StockMonitorApp:
         self.screen_count_var = tk.StringVar(value="点击「查询」开始筛选")
         ttk.Label(top, textvariable=self.screen_count_var, foreground="#333").pack(side="left", padx=10)
 
+        # 第二行: 当日 vs 昨日 对比条件(量化筛股)
+        top2 = ttk.Frame(self.tab_screen, padding=(8, 0))
+        top2.pack(fill="x")
+        ttk.Label(top2, text="昨日涨幅").pack(side="left")
+        self.f_prev_min_var = tk.StringVar(value="")      # 留空 = 不限
+        ttk.Entry(top2, textvariable=self.f_prev_min_var, width=5).pack(side="left")
+        ttk.Label(top2, text="% ~ ").pack(side="left")
+        self.f_prev_max_var = tk.StringVar(value="")
+        ttk.Entry(top2, textvariable=self.f_prev_max_var, width=5).pack(side="left")
+        ttk.Label(top2, text="%").pack(side="left")
+        ttk.Label(top2, text="  连涨≥").pack(side="left")
+        self.f_streak_var = tk.StringVar(value="")
+        ttk.Entry(top2, textvariable=self.f_streak_var, width=4).pack(side="left")
+        ttk.Label(top2, text="天(含今日)").pack(side="left")
+        self.f_accel_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(top2, text="仅看涨幅加速(今日>昨日)", variable=self.f_accel_var).pack(side="left", padx=10)
+        self.f_news_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(top2, text="仅看24h有利好", variable=self.f_news_var).pack(side="left", padx=4)
+        ttk.Label(top2, text="· 留空/不勾 = 不限", foreground="#888").pack(side="left", padx=6)
+
         # 结果表格
-        cols = ("code", "name", "industry", "price", "pct", "lb", "hs", "amount", "volume", "bias")
-        headers = ("代码", "名称", "行业", "现价", "涨跌幅", "量比", "换手率", "成交额", "成交量", "开盘倾向")
-        widths = (76, 108, 92, 84, 84, 66, 76, 92, 92, 96)
+        cols = ("code", "name", "industry", "price", "pct", "pct_prev", "delta", "streak",
+                "news", "lb", "hs", "amount", "volume", "bias")
+        headers = ("代码", "名称", "行业", "现价", "涨跌幅", "昨涨幅", "涨幅差", "连涨",
+                   "24h消息", "量比", "换手率", "成交额", "成交量", "开盘倾向")
+        widths = (72, 100, 88, 76, 76, 72, 72, 48, 104, 60, 72, 88, 88, 92)
         self.screen_cols = cols
         self.screen_headers = dict(zip(cols, headers))
         tf = ttk.Frame(self.tab_screen, padding=(8, 4))
@@ -888,16 +1168,30 @@ class StockMonitorApp:
     def _run_screen(self):
         if self._screen_busy:
             return
+
+        def opt_float(var):
+            """可选数值过滤项: 留空返回 None(=不限)。"""
+            s = (var.get() or "").strip()
+            return float(s) if s else None
         try:
             f_min = float(self.f_min_var.get())
             f_max = float(self.f_max_var.get())
             lb_min = float(self.f_lb_var.get())
             hs_min = float(self.f_hs_var.get())
+            p_min = opt_float(self.f_prev_min_var)
+            p_max = opt_float(self.f_prev_max_var)
+            st_min = opt_float(self.f_streak_var)
         except ValueError:
-            messagebox.showwarning("参数错误", "请填写数字: 涨幅区间 / 量比 / 换手率")
+            messagebox.showwarning("参数错误", "请填写数字: 涨幅区间 / 量比 / 换手率 / 昨日涨幅 / 连涨")
             return
         if f_min > f_max:
             f_min, f_max = f_max, f_min
+        if p_min is not None and p_max is not None and p_min > p_max:
+            p_min, p_max = p_max, p_min
+        if st_min is not None:
+            st_min = max(0, st_min)
+        accel_only = self.f_accel_var.get()
+        news_only = self.f_news_var.get()
 
         self._screen_busy = True
         self.screen_btn.configure(state="disabled")
@@ -926,17 +1220,70 @@ class StockMonitorApp:
                 if cands:
                     with ThreadPoolExecutor(max_workers=24) as ex:
                         cands = list(ex.map(enrich, cands))
-                # 组装行(含全部原始因子字段), 暂不填开盘倾向
+                # 第三段: 日K补齐「昨日」指标(昨涨幅/连涨/昨日量比, 当日缓存), 供对比过滤与打分
+                self.root.after(0, lambda: self.screen_count_var.set(
+                    f"正在抓取日K对比昨涨幅... ({len(cands)} 只)"))
+
+                def enrich_kline(r):
+                    m = fetch_prev_metrics(r.get("symbol"))
+                    if m:
+                        r["pct_prev"] = m.get("p")
+                        r["streak_base"] = m.get("s")
+                        r["vr"] = m.get("vr")
+                    return r
+                if cands:
+                    with ThreadPoolExecutor(max_workers=24) as ex:
+                        cands = list(ex.map(enrich_kline, cands))
+                # 第四段: 24h消息面(东财个股资讯, 利好/利空计数), 参与过滤与打分
+                self.root.after(0, lambda: self.screen_count_var.set(
+                    f"正在抓取24h消息面... ({len(cands)} 只)"))
+
+                def enrich_news(r):
+                    sym = r.get("symbol") or ""
+                    _items, stats = fetch_stock_news(sym[:2], sym[2:])
+                    r["news_pos"] = stats.get("n_pos", 0)
+                    r["news_neg"] = stats.get("n_neg", 0)
+                    return r
+                if cands:
+                    with ThreadPoolExecutor(max_workers=24) as ex:
+                        cands = list(ex.map(enrich_news, cands))
+                # 组装行(含全部原始因子字段) + 当日 vs 昨日对比过滤, 暂不填开盘倾向
                 rows = []
                 for r in cands:
                     lb = to_float(r.get("lb")) or 0.0
                     if lb < lb_min:
                         continue
+                    cp = to_float(r.get("changepercent"))
+                    pp = r.get("pct_prev")
+                    # 昨日涨幅区间过滤(启用该条件时, 数据缺失的直接排除)
+                    if p_min is not None and (pp is None or pp < p_min):
+                        continue
+                    if p_max is not None and (pp is None or pp > p_max):
+                        continue
+                    delta = round(cp - pp, 2) if (cp is not None and pp is not None) else None
+                    if accel_only and (delta is None or delta <= 0):
+                        continue
+                    streak = None
+                    if r.get("streak_base") is not None:
+                        streak = r["streak_base"] + 1 if (cp is not None and cp > 0) else 0
+                    if st_min is not None and (streak is None or streak < st_min):
+                        continue
+                    n_pos = r.get("news_pos") or 0
+                    n_neg = r.get("news_neg") or 0
+                    if news_only and n_pos < 1:
+                        continue
                     rows.append({
                         "code": r.get("code"), "name": r.get("name"),
                         "symbol": r.get("symbol"),
                         "price": to_float(r.get("trade")),
-                        "pct": to_float(r.get("changepercent")),
+                        "pct": cp,
+                        "pct_prev": pp,
+                        "delta": delta,
+                        "streak": streak,
+                        "vr": r.get("vr"),
+                        "news_pos": n_pos,
+                        "news_neg": n_neg,
+                        "news_score": n_pos - n_neg,
                         "lb": lb,
                         "hs": to_float(r.get("turnoverratio")),
                         "amount": to_float(r.get("amount"), 0),
@@ -947,7 +1294,8 @@ class StockMonitorApp:
                     })
                 # 横截面多因子合成开盘倾向(分位排名 + 加权, 0~100)
                 open_bias_composite(rows)
-                sort_key = {"量比": "lb", "换手率": "hs", "涨跌幅": "pct",
+                sort_key = {"量比": "lb", "换手率": "hs", "涨跌幅": "pct", "昨涨幅": "pct_prev",
+                            "涨幅差": "delta", "连涨": "streak", "24h消息": "news_score",
                             "成交额": "amount", "开盘倾向": "bias"}
                 key = sort_key.get(self.sort_var.get(), "lb")
                 rows.sort(key=lambda x: x.get(key) if x.get(key) is not None else -1e18, reverse=True)
@@ -976,8 +1324,9 @@ class StockMonitorApp:
         if final:
             self._screen_busy = False
             self.screen_btn.configure(state="normal")
-            self.screen_count_var.set(f"共筛出 {len(rows)} 只 (A股: 涨幅区间 + 换手率 + 量比)")
+            self.screen_count_var.set(f"共筛出 {len(rows)} 只 (涨幅区间 + 换手 + 量比 + 昨日对比 + 24h消息面)")
             _save_industry_cache()
+            _save_kline_cache()
         else:
             self.screen_count_var.set(f"已筛出 {len(rows)} 只, 正在补齐行业...")
 
@@ -1003,6 +1352,10 @@ class StockMonitorApp:
                 r.get("industry") or "—",
                 fmt_price(r.get("price")),
                 fmt_pct(r.get("pct")),
+                fmt_pct(r.get("pct_prev")),
+                fmt_pct(r.get("delta")),
+                "--" if r.get("streak") is None else f"{r['streak']}",
+                fmt_news(r),
                 fmt_price(r.get("lb")),
                 fmt_pct_plain(r.get("hs")),
                 fmt_amount(r.get("amount")),
@@ -1014,7 +1367,10 @@ class StockMonitorApp:
 
     def _screen_sort_value(self, r, col):
         """选股器行某列的可排序值; None 表示缺失(排最后)。"""
-        if col in ("price", "pct", "lb", "hs", "amount", "volume", "bias"):
+        if col == "news":
+            return r.get("news_score")
+        if col in ("price", "pct", "pct_prev", "delta", "streak", "lb", "hs", "amount",
+                   "volume", "bias"):
             return r.get(col)
         return r.get(col) or ""
 
@@ -1144,6 +1500,7 @@ class StockMonitorApp:
         menu.add_command(label=f"复制代码 {code}", command=lambda: self._copy_code(code))
         c = classify_symbol(code)
         mkt = c[2] if c else ""
+        menu.add_command(label="查看24h资讯", command=lambda: self._open_news24(code))
         if mkt in ("sh", "sz", "bj"):
             menu.add_command(label="查看公告消息", command=lambda: self._open_news(code))
         self._popup = menu
@@ -1271,16 +1628,174 @@ class StockMonitorApp:
         if art:
             webbrowser.open(ANNOUNCE_DETAIL.format(code=code, art_code=art))
 
+    # ---------------- 24h消息面弹窗(三市场) ----------------
+    def _open_news24(self, code):
+        """24h消息面弹窗: 东财个股资讯, 仅展示近24小时, 利好/利空关键词标注。"""
+        c = classify_symbol(code)
+        if not c:
+            return
+        _tcode, disp, mkt = c
+        qt_code = ""
+        entry = self.stock_results.get(code)     # 自选盯盘行情里有美股完整代码(如 AAPL.OQ)
+        if entry and entry[0]:
+            qt_code = entry[0].get("qt_code") or ""
+
+        win = tk.Toplevel(self.root)
+        win.title(f"24h消息面 - {disp}")
+        win.geometry("880x560")
+        win.transient(self.root)
+
+        hdr = ttk.Frame(win, padding=(8, 6))
+        hdr.pack(fill="x")
+        ttk.Label(hdr, text=f"{disp} 近24小时资讯 · 利好/利空为关键词启发式标注",
+                  font=("Microsoft YaHei", 10, "bold")).pack(side="left")
+        status = tk.StringVar(value="加载中...")
+        ttk.Label(hdr, textvariable=status, foreground="#666").pack(side="right")
+
+        tf = ttk.Frame(win, padding=(8, 4))
+        tf.pack(fill="both", expand=True)
+        cols = ("time", "impact", "title", "url")
+        headers = {"time": "时间", "impact": "影响", "title": "标题"}
+        tree = ttk.Treeview(tf, columns=cols, show="headings")
+        for cname in ("time", "impact", "title"):
+            tree.heading(cname, text=headers[cname])
+        tree.column("time", width=96, anchor="center")
+        tree.column("impact", width=56, anchor="center")
+        tree.column("title", width=660, anchor="w")
+        tree.column("url", width=0, stretch=False)
+        vsb = ttk.Scrollbar(tf, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        tree.tag_configure("利好", foreground=COLOR_UP_DEFAULT)
+        tree.tag_configure("利空", foreground=COLOR_DOWN_DEFAULT)
+        tree.tag_configure("中性", foreground=COLOR_FLAT)
+        tree.bind("<Double-1>", lambda e: self._open_url_from_tree(tree, 3))
+
+        def work():
+            try:
+                items, stats = fetch_stock_news(mkt, disp, qt_code, size=50)
+                err = None
+            except Exception as ex:
+                items, stats, err = [], {"n_pos": 0, "n_neg": 0}, str(ex)
+
+            def update_ui():
+                if err:
+                    status.set(f"加载失败: {err}")
+                    return
+                for it in items:
+                    tree.insert("", "end", values=(it["time"], it["impact"], it["title"], it["url"]),
+                                tags=(it["impact"],))
+                if items:
+                    status.set(f"共 {len(items)} 条 · 利好 {stats['n_pos']} · "
+                               f"利空 {stats['n_neg']} · 双击打开原文")
+                else:
+                    status.set("近24小时无资讯")
+            win.after(0, update_ui)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _open_url_from_tree(self, tree, idx):
+        sel = tree.selection()
+        if not sel:
+            return
+        url = tree.item(sel[0], "values")[idx]
+        if url:
+            webbrowser.open(url)
+
+    # ================ 7x24快讯 ================
+    def _build_feed_tab(self):
+        ctrl = ttk.Frame(self.tab_feed, padding=(8, 6))
+        ctrl.pack(fill="x")
+        ttk.Button(ctrl, text="刷新", command=self._feed_refresh).pack(side="left")
+        self.feed_auto_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(ctrl, text="自动刷新(60秒)", variable=self.feed_auto_var).pack(side="left", padx=8)
+        ttk.Label(ctrl, text="  关键词过滤:").pack(side="left")
+        self.feed_kw_var = tk.StringVar()
+        ent = ttk.Entry(ctrl, textvariable=self.feed_kw_var, width=18)
+        ent.pack(side="left", padx=4)
+        ent.bind("<KeyRelease>", lambda e: self._render_feed())
+        self.feed_status_var = tk.StringVar(value="加载中...")
+        ttk.Label(ctrl, textvariable=self.feed_status_var, foreground="#666").pack(side="right")
+
+        tf = ttk.Frame(self.tab_feed, padding=(8, 4))
+        tf.pack(fill="both", expand=True)
+        cols = ("time", "impact", "text", "url")
+        self.ftree = ttk.Treeview(tf, columns=cols, show="headings")
+        for cname, h, w, a in (("time", "时间", 96, "center"), ("impact", "影响", 56, "center"),
+                               ("text", "内容", 1020, "w")):
+            self.ftree.heading(cname, text=h)
+            self.ftree.column(cname, width=w, anchor=a)
+        self.ftree.column("url", width=0, stretch=False)
+        vsb = ttk.Scrollbar(tf, orient="vertical", command=self.ftree.yview)
+        self.ftree.configure(yscrollcommand=vsb.set)
+        self.ftree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        self.ftree.tag_configure("利好", foreground=COLOR_UP_DEFAULT)
+        self.ftree.tag_configure("利空", foreground=COLOR_DOWN_DEFAULT)
+        self.ftree.tag_configure("中性", foreground=COLOR_FLAT)
+        self.ftree.bind("<Double-1>", lambda e: self._open_url_from_tree(self.ftree, 3))
+        self.feed_rows = []
+        self._feed_queue = queue.Queue()      # 工作线程只入队, 由主线程泵渲染(不跨线程碰 Tk)
+        self._feed_refresh()
+        self.root.after(300, self._feed_pump)
+        self.root.after(60000, self._feed_tick)
+
+    def _feed_tick(self):
+        """每 60 秒心跳: 勾选自动刷新时才真正抓取。"""
+        if not self._stop:
+            if self.feed_auto_var.get():
+                self._feed_refresh()
+            self.root.after(60000, self._feed_tick)
+
+    def _feed_refresh(self):
+        def work():
+            self._feed_queue.put(fetch_flash_news(50))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _feed_pump(self):
+        """主线程: 排空快讯队列并渲染。"""
+        try:
+            while True:
+                rows = self._feed_queue.get_nowait()
+                self.feed_rows = rows
+                self._render_feed()
+                if rows:
+                    self.feed_status_var.set(
+                        f"新浪7x24 · 最新 {rows[0]['time']} · 共 {len(rows)} 条 · 双击打开原文")
+                else:
+                    self.feed_status_var.set("快讯获取失败或为空")
+        except queue.Empty:
+            pass
+        if not self._stop:
+            self.root.after(300, self._feed_pump)
+
+    def _render_feed(self):
+        self.ftree.delete(*self.ftree.get_children())
+        kw = (self.feed_kw_var.get() or "").strip().lower()
+        shown = 0
+        for i, r in enumerate(self.feed_rows):
+            if kw and kw not in r["text"].lower():
+                continue
+            self.ftree.insert("", "end", iid=str(i),
+                              values=(r["time"], r["impact"], r["text"], r["url"]),
+                              tags=(r["impact"],))
+            shown += 1
+        if kw:
+            self.feed_status_var.set(f"过滤「{kw}」: 命中 {shown} / {len(self.feed_rows)} 条")
+
     # ---------------- 关闭 ----------------
     def _on_close(self):
         self._stop = True
         self._save_config()
         _save_industry_cache()
+        _save_kline_cache()
         self.root.destroy()
 
 
 def main():
     _load_industry_cache()
+    _load_kline_cache()
     root = tk.Tk()
     app = StockMonitorApp(root)
     app._poll()
