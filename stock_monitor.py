@@ -8,16 +8,19 @@ A股 / 港股 / 美股 桌面看盘 + A股选股器 (零依赖: Python 标准库
   - 选股器:        新浪 A股全市场列表 (涨跌幅+换手率) + 腾讯单只补齐量比
   - 历史日K:       腾讯 web.ifzq.gtimg.cn (昨日涨幅对比 / 连涨 / 昨日量能)
   - 24h消息面:     东财个股资讯(np-listapi, 三市场) + 新浪 7x24 全球快讯
+  - 问财选股:      同花顺 iwencai 自然语言筛选 (可选依赖 pywencai + Node.js + 登录cookie)
 均为免费、免密钥、大陆可直连。行情为延时行情(美股/港股约15分钟, A股盘中约3秒), 仅供监控参考,
 不构成任何投资建议。
 
 运行:  python stock_monitor.py
 """
 
+import importlib.util
 import json
 import math
 import os
 import queue
+import shutil
 import threading
 import time
 import urllib.request
@@ -412,7 +415,7 @@ def fetch_industry(symbol):
 # 把原「启发式单指标」升级为「多因子横截面打分」:
 #   1) 每个因子在候选集内做分位排名(0~1), 天然稳健、抗离群值、量纲统一
 #   2) 因子按先验权重线性合成, 权重和为 1, 映射到 0~100
-#   3) 标签用固定阈值(65/35), 对应约前 1/3「高开」/ 后 1/3「低开」
+#   3) 标签用固定阈值(60/40), 约对应前/后 15~20%「高开」/「低开」
 # 因子分三类:
 #   - 时间序列因子(当日 vs 昨日, 来自日K): 动量加速度(涨幅差)、连涨天数、昨日量能
 #   - 当日截面因子(实时快照): 尾盘强度、量比、换手、成交额、日内动量
@@ -434,9 +437,27 @@ FACTOR_WEIGHTS = {
     "momentum":       0.05,   # 当日涨跌幅(筛选区间窄, 区分度低)
 }
 
-# 开盘倾向标签阈值(0~100 分)
-BIAS_HIGH = 65
-BIAS_LOW = 35
+# 开盘倾向标签阈值(0~100 分)。
+# 9 因子合成分位加权的分布集中在中位附近(约50±10), 60/40 约对应前/后 15~20%。
+BIAS_HIGH = 60
+BIAS_LOW = 40
+
+# 买入候选信号阈值(0~4 项共振)
+SIGNAL_STRONG = 4          # 4 项全共振: 强候选(深黄底)
+SIGNAL_CAND = 3            # >=3 项: 候选(浅黄底)
+
+
+def buy_signal(row):
+    """买入候选信号: 统计 4 项多头条件的共振数(0~4)。
+    条件: 开盘倾向>=60 / 涨幅差>0(今日强于昨日) / 连涨>=2天(含今日) / 24h无利空消息。
+    缺失数据按不满足处理(保守)。仅作筛选参考, 不构成投资建议。"""
+    checks = (
+        row.get("bias") is not None and row["bias"] >= BIAS_HIGH,
+        row.get("delta") is not None and row["delta"] > 0,
+        row.get("streak") is not None and row["streak"] >= 2,
+        row.get("news_score") is not None and row["news_score"] >= 0,
+    )
+    return sum(1 for ok in checks if ok)
 
 
 def _f_close_position(row):
@@ -728,6 +749,135 @@ def fmt_news(r):
 
 
 # ---------------------------------------------------------------------------
+# 问财选股(可选依赖): 同花顺 iwencai 自然语言筛选
+# ---------------------------------------------------------------------------
+# 依赖: pip install pywencai  +  Node.js(hexin-v token 生成)  +  登录cookie
+# iwencai 接口有同花顺风控(匿名 403 Access Denied), 需要浏览器 cookie:
+#   打开 www.iwencai.com -> F12 -> 控制台执行 document.cookie -> 复制粘贴到问财页输入框
+# 本体保持零依赖: 未安装 pywencai/Node 时问财页仅提示, 其余功能不受影响。
+# ---------------------------------------------------------------------------
+
+_PYWENCAI_MOD = None
+_PYWENCAI_PATCHED = False
+
+
+def _patch_pywencai_headers():
+    """补齐 Origin/Referer 并固定浏览器 UA。
+    iwencai 网关校验这些头, 缺失会被 WAF 直接 403(2026 年起, pywencai 官方未适配);
+    cookie 须含完整登录态(sess_tk/ticket/utk 等), 只带部分字段会报「未登陆」。"""
+    global _PYWENCAI_PATCHED
+    if _PYWENCAI_PATCHED:
+        return
+    import pywencai.wencai as _wc_mod
+    _orig = _wc_mod.headers
+
+    def patched(cookie=None, user_agent=None):
+        h = _orig(cookie, user_agent)
+        h["User-Agent"] = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                           "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+        h["Origin"] = "https://www.iwencai.com"
+        h["Referer"] = "https://www.iwencai.com/"
+        h["Accept"] = "application/json"
+        return h
+
+    _wc_mod.headers = patched
+    _PYWENCAI_PATCHED = True
+
+
+def _wencai_ready():
+    """(可用, 原因)。pywencai 与 Node.js 均在时可用。"""
+    if importlib.util.find_spec("pywencai") is None:
+        return False, "未安装 pywencai (pip install pywencai)"
+    if shutil.which("node") is None:
+        return False, "未安装 Node.js (生成 hexin-v token 需要)"
+    return True, ""
+
+
+def _wc_cell(v):
+    """DataFrame 单元格 -> 可展示/可排序的纯量; NaN/None -> ""。"""
+    if v is None:
+        return ""
+    if isinstance(v, float):
+        if v != v:                      # NaN
+            return ""
+        return round(v, 4)
+    if isinstance(v, int):
+        return v
+    if hasattr(v, "isoformat"):         # date / datetime
+        return v.isoformat()[:10]
+    return str(v)
+
+
+def _wc_num(v):
+    """尝试把单元格识别为数值; 失败返回 None。数字型字符串(如 '29.9692...')也识别,
+    但不含小数点的纯数字串(可能是代码/日期)不转, 避免 '000625' 被破坏。"""
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str) and "." in v:
+        try:
+            return float(v)
+        except ValueError:
+            pass
+    return None
+
+
+def _wc_disp(v):
+    """单元格展示文本: 大数加千分位, 小数去尾零; 数字型字符串先转数值再格式化。"""
+    if isinstance(v, str):
+        f = _wc_num(v)
+        if f is not None:
+            v = f
+    if isinstance(v, float):
+        if abs(v) >= 1e5:
+            return f"{v:,.0f}"
+        s = f"{v:.3f}".rstrip("0").rstrip(".")
+        return s if s not in ("", "-") else "0"
+    return str(v)
+
+
+def wencai_query(query, cookie=""):
+    """执行问财自然语言查询, 返回 (cols, rows)。cols=list[str], rows=list[list]。
+    失败抛 RuntimeError(中文原因)。应在后台线程调用(阻塞网络, 首次加载 pandas 较慢)。"""
+    global _PYWENCAI_MOD
+    ok, why = _wencai_ready()
+    if not ok:
+        raise RuntimeError(why)
+    if _PYWENCAI_MOD is None:
+        import pywencai
+        _PYWENCAI_MOD = pywencai
+    _patch_pywencai_headers()
+    kw = {"query": query, "log": False}
+    if cookie.strip():
+        kw["cookie"] = cookie.strip()
+    try:
+        df = _PYWENCAI_MOD.get(**kw)
+    except Exception as e:
+        # pywencai 内部重试 10 次失败后返回 None -> AttributeError; 被 403/401 拦截时即此表现
+        raise RuntimeError(f"问财查询失败({type(e).__name__}): cookie 缺失/失效会报 403/未登陆, "
+                           f"请从浏览器重新复制完整 document.cookie 后再试")
+    if df is None or not hasattr(df, "columns") or len(df) == 0:
+        raise RuntimeError("问财无匹配结果(换个条件描述试试, 如「今日涨幅大于4%」)")
+    cols = [" / ".join(map(str, c)) if isinstance(c, tuple) else str(c) for c in df.columns]
+    rows = [[_wc_cell(v) for v in row] for row in df.values.tolist()]
+    # 代码/名称列提到最前, 便于阅读与右键操作
+    front = [c for c in ("股票代码", "股票简称") if c in cols]
+    if front:
+        idx = [cols.index(c) for c in front]
+        rest = [i for i in range(len(cols)) if i not in idx]
+        order = idx + rest
+        cols = [cols[i] for i in order]
+        rows = [[r[i] for i in order] for r in rows]
+    return cols, rows
+
+
+def _wc_code_of(value):
+    """问财代码列取 6 位 A股代码: '600519.SH' / '600519' -> '600519'。"""
+    s = str(value or "")
+    digits = "".join(ch for ch in s if ch.isdigit())
+    return digits[:6] if len(digits) >= 6 else s
+
+
+# ---------------------------------------------------------------------------
 # 主窗口
 # ---------------------------------------------------------------------------
 
@@ -775,17 +925,24 @@ class StockMonitorApp:
             self.watchlist = [str(t).upper() for t in cfg.get("watchlist", DEFAULT_WATCHLIST)]
             self.interval = int(cfg.get("interval", 5))
             self.cn_color = bool(cfg.get("cn_color", True))
+            self.wencai_cookie = str(cfg.get("wencai_cookie", ""))
+            self.wencai_last_query = str(cfg.get("wencai_last_query", ""))
         except Exception:
             self.watchlist = list(DEFAULT_WATCHLIST)
             self.interval = 5
             self.cn_color = True
+            self.wencai_cookie = ""
+            self.wencai_last_query = ""
         self.interval = max(3, min(3600, self.interval))
 
     def _save_config(self):
         try:
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump({"watchlist": self.watchlist, "interval": self.interval,
-                           "cn_color": self.cn_color}, f, ensure_ascii=False, indent=2)
+                           "cn_color": self.cn_color,
+                           "wencai_cookie": getattr(self, "wencai_cookie", ""),
+                           "wencai_last_query": getattr(self, "wencai_last_query", "")},
+                          f, ensure_ascii=False, indent=2)
         except Exception as e:
             print("配置保存失败:", e)
 
@@ -800,15 +957,19 @@ class StockMonitorApp:
         style.theme_use("clam")
         nb = ttk.Notebook(self.root)
         nb.pack(fill="both", expand=True)
+        self.nb = nb
         self.tab_watch = ttk.Frame(nb)
         self.tab_screen = ttk.Frame(nb)
         self.tab_feed = ttk.Frame(nb)
+        self.tab_wencai = ttk.Frame(nb)
         nb.add(self.tab_watch, text="  自选盯盘  ")
         nb.add(self.tab_screen, text="  选股器(A股)  ")
         nb.add(self.tab_feed, text="  7x24快讯  ")
+        nb.add(self.tab_wencai, text="  问财选股  ")
         self._build_watch_tab()
         self._build_screen_tab()
         self._build_feed_tab()
+        self._build_wencai_tab()
 
     # ================ 自选盯盘 ================
     def _build_watch_tab(self):
@@ -1093,10 +1254,11 @@ class StockMonitorApp:
         self.sort_var = tk.StringVar(value="量比")
         ttk.Combobox(top, textvariable=self.sort_var, width=8, state="readonly",
                      values=("量比", "换手率", "涨跌幅", "昨涨幅", "涨幅差", "连涨",
-                             "24h消息", "成交额", "开盘倾向")).pack(side="left", padx=2)
+                             "24h消息", "买入信号", "成交额", "开盘倾向")).pack(side="left", padx=2)
 
         self.screen_btn = ttk.Button(top, text="查询", command=self._run_screen)
         self.screen_btn.pack(side="left", padx=6)
+        ttk.Button(top, text="转问财", command=self._screen_to_wencai).pack(side="left", padx=2)
 
         self.screen_count_var = tk.StringVar(value="点击「查询」开始筛选")
         ttk.Label(top, textvariable=self.screen_count_var, foreground="#333").pack(side="left", padx=10)
@@ -1119,14 +1281,16 @@ class StockMonitorApp:
         ttk.Checkbutton(top2, text="仅看涨幅加速(今日>昨日)", variable=self.f_accel_var).pack(side="left", padx=10)
         self.f_news_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(top2, text="仅看24h有利好", variable=self.f_news_var).pack(side="left", padx=4)
+        self.f_signal_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(top2, text="仅看买入候选(≥3项共振)", variable=self.f_signal_var).pack(side="left", padx=4)
         ttk.Label(top2, text="· 留空/不勾 = 不限", foreground="#888").pack(side="left", padx=6)
 
         # 结果表格
         cols = ("code", "name", "industry", "price", "pct", "pct_prev", "delta", "streak",
-                "news", "lb", "hs", "amount", "volume", "bias")
+                "news", "lb", "hs", "amount", "volume", "bias", "signal")
         headers = ("代码", "名称", "行业", "现价", "涨跌幅", "昨涨幅", "涨幅差", "连涨",
-                   "24h消息", "量比", "换手率", "成交额", "成交量", "开盘倾向")
-        widths = (72, 100, 88, 76, 76, 72, 72, 48, 104, 60, 72, 88, 88, 92)
+                   "24h消息", "量比", "换手率", "成交额", "成交量", "开盘倾向", "买入信号")
+        widths = (72, 100, 88, 76, 76, 72, 72, 48, 104, 60, 72, 88, 88, 92, 84)
         self.screen_cols = cols
         self.screen_headers = dict(zip(cols, headers))
         tf = ttk.Frame(self.tab_screen, padding=(8, 4))
@@ -1145,6 +1309,9 @@ class StockMonitorApp:
         self.stree.tag_configure("up", foreground=COLOR_UP_DEFAULT)
         self.stree.tag_configure("down", foreground=COLOR_DOWN_DEFAULT)
         self.stree.tag_configure("flat", foreground=COLOR_FLAT)
+        # 买入候选行背景高亮(与涨跌前景色叠加: 多标签各管各的选项)
+        self.stree.tag_configure("sig3", background="#fff2a6")   # 候选(3项共振) 浅黄
+        self.stree.tag_configure("sig4", background="#ffd24d")   # 强候选(4项) 黄
         self.stree.bind("<Double-1>", self._open_screen_detail)
         self.stree.bind("<Button-3>", self._on_screen_right_click)
 
@@ -1164,6 +1331,8 @@ class StockMonitorApp:
         self.goto_var = tk.StringVar()
         ttk.Entry(pg, textvariable=self.goto_var, width=5).pack(side="left")
         ttk.Button(pg, text="跳转", command=self._screen_goto).pack(side="left", padx=2)
+        ttk.Label(pg, text="黄底=买入候选 · 条件(4项共振): 倾向≥60 / 涨幅加速 / 连涨≥2 / 24h无利空",
+                  foreground="#999").pack(side="left", padx=14)
 
     def _run_screen(self):
         if self._screen_busy:
@@ -1192,6 +1361,7 @@ class StockMonitorApp:
             st_min = max(0, st_min)
         accel_only = self.f_accel_var.get()
         news_only = self.f_news_var.get()
+        signal_only = self.f_signal_var.get()
 
         self._screen_busy = True
         self.screen_btn.configure(state="disabled")
@@ -1294,9 +1464,14 @@ class StockMonitorApp:
                     })
                 # 横截面多因子合成开盘倾向(分位排名 + 加权, 0~100)
                 open_bias_composite(rows)
+                # 买入候选信号: 4项多头条件共振计数, >=3 项黄底高亮
+                for r in rows:
+                    r["signal"] = buy_signal(r)
+                if signal_only:
+                    rows = [r for r in rows if r["signal"] >= SIGNAL_CAND]
                 sort_key = {"量比": "lb", "换手率": "hs", "涨跌幅": "pct", "昨涨幅": "pct_prev",
                             "涨幅差": "delta", "连涨": "streak", "24h消息": "news_score",
-                            "成交额": "amount", "开盘倾向": "bias"}
+                            "买入信号": "signal", "成交额": "amount", "开盘倾向": "bias"}
                 key = sort_key.get(self.sort_var.get(), "lb")
                 rows.sort(key=lambda x: x.get(key) if x.get(key) is not None else -1e18, reverse=True)
                 # 先显示(行业占位为 …)
@@ -1324,7 +1499,10 @@ class StockMonitorApp:
         if final:
             self._screen_busy = False
             self.screen_btn.configure(state="normal")
-            self.screen_count_var.set(f"共筛出 {len(rows)} 只 (涨幅区间 + 换手 + 量比 + 昨日对比 + 24h消息面)")
+            n_sig = sum(1 for r in rows if (r.get("signal") or 0) >= SIGNAL_CAND)
+            n_strong = sum(1 for r in rows if (r.get("signal") or 0) >= SIGNAL_STRONG)
+            self.screen_count_var.set(
+                f"共筛出 {len(rows)} 只 · 买入候选 {n_sig} 只(黄底, 其中强候选 {n_strong})")
             _save_industry_cache()
             _save_kline_cache()
         else:
@@ -1343,7 +1521,10 @@ class StockMonitorApp:
         chunk = self.screen_rows[start:start + self.screen_page_size]
         for r in chunk:
             label = r.get("bias_label") or "中性"
-            tag = "up" if label == "高开" else ("down" if label == "低开" else "flat")
+            bias_tag = "up" if label == "高开" else ("down" if label == "低开" else "flat")
+            sig = r.get("signal") or 0
+            # 信号>=3 加黄底标签(背景), 与涨跌前景色标签叠加
+            tags = ((f"sig{sig}",) if sig >= SIGNAL_CAND else ()) + (bias_tag,)
             score = r.get("bias")
             bias_text = "--" if score is None else f"{label} {score:d}"
             vals = (
@@ -1361,8 +1542,9 @@ class StockMonitorApp:
                 fmt_amount(r.get("amount")),
                 fmt_vol(r.get("volume")),
                 bias_text,
+                "★" * sig,
             )
-            self.stree.insert("", "end", values=vals, tags=(tag,))
+            self.stree.insert("", "end", values=vals, tags=tags)
         self.page_var.set(f"第 {self.screen_page + 1} / {pages} 页")
 
     def _screen_sort_value(self, r, col):
@@ -1370,7 +1552,7 @@ class StockMonitorApp:
         if col == "news":
             return r.get("news_score")
         if col in ("price", "pct", "pct_prev", "delta", "streak", "lb", "hs", "amount",
-                   "volume", "bias"):
+                   "volume", "bias", "signal"):
             return r.get(col)
         return r.get(col) or ""
 
@@ -1783,6 +1965,205 @@ class StockMonitorApp:
             shown += 1
         if kw:
             self.feed_status_var.set(f"过滤「{kw}」: 命中 {shown} / {len(self.feed_rows)} 条")
+
+    # ================ 问财选股 ================
+    WENCAI_PRESETS = (
+        "今日涨幅4%到5%，量比大于1.5，换手率大于3%",
+        "昨日涨幅1%到4%，今日涨幅4%到5%，今日涨幅大于昨日涨幅",
+        "连续上涨3天，换手率大于5%，非ST，市盈率小于50",
+        "近5日涨幅大于10%，总市值小于100亿，非科创板，非北交所",
+    )
+
+    def _build_wencai_tab(self):
+        top = ttk.Frame(self.tab_wencai, padding=(8, 6))
+        top.pack(fill="x")
+        ttk.Label(top, text="自然语言:").pack(side="left")
+        self.wencai_query_var = tk.StringVar(value=self.wencai_last_query)
+        ent = ttk.Entry(top, textvariable=self.wencai_query_var, width=56)
+        ent.pack(side="left", padx=4)
+        ent.bind("<Return>", lambda e: self._wencai_run())
+        self.wencai_btn = ttk.Button(top, text="查询", command=self._wencai_run)
+        self.wencai_btn.pack(side="left", padx=4)
+        ttk.Label(top, text="  预设:").pack(side="left")
+        cb = ttk.Combobox(top, width=30, state="readonly", values=self.WENCAI_PRESETS)
+        cb.pack(side="left")
+        cb.bind("<<ComboboxSelected>>", lambda e: self.wencai_query_var.set(cb.get()))
+        self.wencai_status_var = tk.StringVar()
+        ttk.Label(top, textvariable=self.wencai_status_var, foreground="#333").pack(side="left", padx=8)
+
+        top2 = ttk.Frame(self.tab_wencai, padding=(8, 0))
+        top2.pack(fill="x")
+        ttk.Label(top2, text="Cookie:").pack(side="left")
+        self.wencai_cookie_var = tk.StringVar(value=self.wencai_cookie)
+        ttk.Entry(top2, textvariable=self.wencai_cookie_var, width=66).pack(side="left", padx=4)
+        ttk.Label(top2, text="浏览器打开 www.iwencai.com → F12 → 控制台执行 document.cookie → 复制粘贴(本地保存)",
+                  foreground="#888").pack(side="left", padx=4)
+
+        tf = ttk.Frame(self.tab_wencai, padding=(8, 4))
+        tf.pack(fill="both", expand=True)
+        self.wctree = ttk.Treeview(tf, columns=(), show="headings")
+        vsb = ttk.Scrollbar(tf, orient="vertical", command=self.wctree.yview)
+        self.wctree.configure(yscrollcommand=vsb.set)
+        self.wctree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        self.wctree.bind("<Double-1>", self._open_wencai_detail)
+        self.wctree.bind("<Button-3>", self._on_wencai_right_click)
+
+        self.wencai_cols = []
+        self.wencai_rows = []
+        self._wencai_busy = False
+        self._wc_sort_col = None
+        self._wc_sort_desc = True
+        self._wencai_queue = queue.Queue()
+        ok, why = _wencai_ready()
+        if ok:
+            self.wencai_status_var.set("就绪 · 输入自然语言条件查询 (首次查询加载模块稍慢)")
+        else:
+            self.wencai_status_var.set(f"不可用: {why}")
+            self.wencai_btn.configure(state="disabled")
+        self.root.after(300, self._wencai_pump)
+
+    def _wencai_run(self):
+        if self._wencai_busy:
+            return
+        query = (self.wencai_query_var.get() or "").strip()
+        if not query:
+            messagebox.showinfo("提示", "请输入自然语言条件, 如: 今日涨幅大于4%，量比大于1.5")
+            return
+        self.wencai_cookie = (self.wencai_cookie_var.get() or "").strip()
+        self.wencai_last_query = query
+        self._save_config()
+        self._wencai_busy = True
+        self.wencai_btn.configure(state="disabled")
+        self.wencai_status_var.set("查询中... (首次加载模块较慢, 请稍候)")
+
+        def work():
+            try:
+                cols, rows = wencai_query(query, self.wencai_cookie)
+                self._wencai_queue.put({"ok": True, "cols": cols, "rows": rows})
+            except Exception as e:
+                self._wencai_queue.put({"ok": False, "err": str(e)})
+        threading.Thread(target=work, daemon=True).start()
+
+    def _wencai_pump(self):
+        """主线程: 排空问财查询结果并渲染(工作线程只入队)。"""
+        try:
+            while True:
+                res = self._wencai_queue.get_nowait()
+                self._wencai_busy = False
+                self.wencai_btn.configure(state="normal")
+                if res.get("ok"):
+                    self._render_wencai(res["cols"], res["rows"])
+                else:
+                    self.wencai_status_var.set(res.get("err", "查询失败"))
+        except queue.Empty:
+            pass
+        if not self._stop:
+            self.root.after(300, self._wencai_pump)
+
+    def _render_wencai(self, cols, rows):
+        rows = rows[:300]
+        shown = cols[:12]
+        self.wencai_cols, self.wencai_rows = cols, rows
+        self.wctree.delete(*self.wctree.get_children())
+        self.wctree.configure(columns=shown)
+        for i, c in enumerate(shown):
+            w = 84 if c == "股票代码" else (120 if c == "股票简称" else 100)
+            self.wctree.heading(c, text=c, command=lambda col=c: self._sort_wencai(col))
+            self.wctree.column(c, width=w, anchor="w" if i < 2 else "e")
+        self._wencai_fill()
+        cap = " · 仅显示前300条" if len(rows) >= 300 else ""
+        extra = f" · 仅显示前12列(共{len(cols)}列)" if len(cols) > 12 else ""
+        self.wencai_status_var.set(
+            f"共 {len(rows)} 条{cap}{extra} · 表头排序 · 右键复制/查资讯 · 双击详情")
+
+    def _wencai_fill(self):
+        self.wctree.delete(*self.wctree.get_children())
+        n = min(12, len(self.wencai_cols))
+        for r in self.wencai_rows:
+            vals = [_wc_disp(v) for v in r[:n]]
+            while len(vals) < n:
+                vals.append("")
+            self.wctree.insert("", "end", values=vals)
+
+    def _sort_wencai(self, col):
+        if col not in self.wencai_cols:
+            return
+        if self._wc_sort_col == col:
+            self._wc_sort_desc = not self._wc_sort_desc
+        else:
+            self._wc_sort_col = col
+            self._wc_sort_desc = True
+        i = self.wencai_cols.index(col)
+
+        def kord(r):
+            v = r[i] if i < len(r) else ""
+            f = _wc_num(v)
+            if f is not None:
+                return (0, f)
+            return (1, str(v))
+        self.wencai_rows.sort(key=kord, reverse=self._wc_sort_desc)
+        self._wencai_fill()
+
+    def _wencai_selected_code(self, item):
+        vals = self.wctree.item(item, "values")
+        if not self.wencai_cols or "股票代码" not in self.wencai_cols[:12]:
+            return ""
+        return _wc_code_of(vals[self.wencai_cols.index("股票代码")])
+
+    def _on_wencai_right_click(self, event):
+        row = self.wctree.identify_row(event.y)
+        if not row:
+            return
+        self.wctree.selection_set(row)
+        code = self._wencai_selected_code(row)
+        if code:
+            self._show_context_menu(event, code)
+
+    def _open_wencai_detail(self, _event):
+        sel = self.wctree.selection()
+        if not sel:
+            return
+        code = self._wencai_selected_code(sel[0])
+        c = classify_symbol(code) if code else None
+        if c:
+            _t, disp, mkt = c
+            webbrowser.open(detail_url(mkt, disp))
+
+    def _screen_to_wencai(self):
+        """把选股器当前条件翻译成问财自然语言查询, 并跳转到问财页。"""
+        def f(var):
+            try:
+                return float(var.get())
+            except (TypeError, ValueError):
+                return None
+        parts = []
+        f_min, f_max = f(self.f_min_var), f(self.f_max_var)
+        if f_min is not None and f_max is not None:
+            parts.append(f"今日涨幅{min(f_min, f_max):g}%到{max(f_min, f_max):g}%")
+        lb, hs = f(self.f_lb_var), f(self.f_hs_var)
+        if lb is not None:
+            parts.append(f"量比大于{lb:g}")
+        if hs is not None:
+            parts.append(f"换手率大于{hs:g}%")
+        p_min, p_max = f(self.f_prev_min_var), f(self.f_prev_max_var)
+        if p_min is not None and p_max is not None:
+            parts.append(f"昨日涨幅{min(p_min, p_max):g}%到{max(p_min, p_max):g}%")
+        elif p_min is not None:
+            parts.append(f"昨日涨幅大于{p_min:g}%")
+        elif p_max is not None:
+            parts.append(f"昨日涨幅小于{p_max:g}%")
+        st = f(self.f_streak_var)
+        if st is not None:
+            parts.append(f"连续上涨{int(st)}天")
+        if self.f_accel_var.get():
+            parts.append("今日涨幅大于昨日涨幅")
+        if not parts:
+            messagebox.showinfo("提示", "请先填写至少一个选股条件")
+            return
+        self.wencai_query_var.set("，".join(parts))
+        self.nb.select(self.tab_wencai)
+        self.wencai_status_var.set("已从选股器生成条件, 点「查询」执行 (需有效 cookie)")
 
     # ---------------- 关闭 ----------------
     def _on_close(self):

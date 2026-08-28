@@ -1,14 +1,24 @@
 # ============================================================
-# 本项目零第三方依赖，无需 pip 安装任何包。
+# 本项目核心零第三方依赖，无需 pip 安装任何包。
 #
 # 运行只需 Python 3.x 自带的标准库：
 #   tkinter           图形界面（Windows/macOS 的官方 Python 已内置）
 #   urllib.request    网络请求（腾讯/新浪/东财接口）
 #   json / os / queue / threading / time / webbrowser
 #   concurrent.futures 并发抓取
+#   importlib.util / shutil  问财可选依赖检测
 #
-# 因此本文件保持为空，直接运行即可：
+# 因此核心功能直接运行即可：
 #   python stock_monitor.py
+#
+# ------------------------------------------------------------
+# 【可选】问财选股（第4个标签页）：
+#   pip install pywencai
+#   并安装 Node.js（pywencai 生成 hexin-v token 需要调用 node）
+#   另需浏览器登录态 cookie（问财接口有同花顺风控，匿名 403）：
+#     浏览器打开 www.iwencai.com → F12 → 控制台执行 document.cookie
+#     → 复制粘贴到「问财选股」页的 Cookie 输入框（本地保存）
+#   未安装以上依赖时，问财页仅提示不可用，其余功能不受影响。
 #
 # ------------------------------------------------------------
 # 个别平台注意：
