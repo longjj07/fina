@@ -1,5 +1,6 @@
 # ============================================================
 # 本项目核心零第三方依赖，无需 pip 安装任何包。
+# 主程序 stock_monitor.py 与因子引擎 factor_engine.py 均只使用 Python 标准库。
 #
 # 运行只需 Python 3.x 自带的标准库：
 #   tkinter           图形界面（Windows/macOS 的官方 Python 已内置）

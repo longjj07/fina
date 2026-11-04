@@ -8,6 +8,7 @@ A股 / 港股 / 美股 桌面看盘 + A股选股器 (零依赖: Python 标准库
   - 选股器:        新浪 A股全市场列表 (涨跌幅+换手率) + 腾讯单只补齐量比
   - 历史日K:       腾讯 web.ifzq.gtimg.cn (昨日涨幅对比 / 连涨 / 昨日量能)
   - 24h消息面:     东财个股资讯(np-listapi, 三市场) + 新浪 7x24 全球快讯
+  - 因子选股:      factor_engine.py (腾讯日K + 新浪成交额股票池, RankIC/ICIR)
   - 问财选股:      同花顺 iwencai 自然语言筛选 (可选依赖 pywencai + Node.js + 登录cookie)
 均为免费、免密钥、大陆可直连。行情为延时行情(美股/港股约15分钟, A股盘中约3秒), 仅供监控参考,
 不构成任何投资建议。
@@ -26,6 +27,11 @@ import time
 import urllib.request
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor
+
+try:
+    import factor_engine
+except Exception:
+    factor_engine = None
 
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -912,9 +918,23 @@ class StockMonitorApp:
         self.screen_sort_col = None
         self.screen_sort_desc = False
 
+        # 因子选股状态
+        self._factor_busy = False
+        self._factor_cancel = threading.Event()
+        self._factor_queue = queue.Queue()
+        self.factor_rows = []
+        self.factor_stats = []
+        self.factor_meta = {}
+        self.factor_wf = {}
+        self.factor_sort_col = None
+        self.factor_sort_desc = True
+        self.factor_stat_sort_col = None
+        self.factor_stat_sort_desc = True
+
         self._load_config()
         self._build_ui()
         self._start_worker()
+        self.root.after(300, self._factor_pump)
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ---------------- 配置 ----------------
@@ -927,12 +947,39 @@ class StockMonitorApp:
             self.cn_color = bool(cfg.get("cn_color", True))
             self.wencai_cookie = str(cfg.get("wencai_cookie", ""))
             self.wencai_last_query = str(cfg.get("wencai_last_query", ""))
+
+            def _ci(key, default, lo, hi):
+                try:
+                    return max(lo, min(hi, int(cfg.get(key, default))))
+                except (TypeError, ValueError):
+                    return default
+
+            def _cf(key, default, lo, hi):
+                try:
+                    return max(lo, min(hi, float(cfg.get(key, default))))
+                except (TypeError, ValueError):
+                    return default
+
+            self.factor_limit = _ci("factor_limit", 300, 50, 800)
+            self.factor_lookback = _ci("factor_lookback", 250, 80, 300)
+            self.factor_horizon = 5 if cfg.get("factor_horizon") == 5 else 1
+            self.factor_threshold = _cf("factor_threshold", 60.0, 0.0, 100.0)
+            self.factor_exclude_st = bool(cfg.get("factor_exclude_st", True))
+            self.factor_exclude_limit = bool(cfg.get("factor_exclude_limit", True))
+            self.factor_show_n = _ci("factor_show_n", 50, 20, 100)
         except Exception:
             self.watchlist = list(DEFAULT_WATCHLIST)
             self.interval = 5
             self.cn_color = True
             self.wencai_cookie = ""
             self.wencai_last_query = ""
+            self.factor_limit = 300
+            self.factor_lookback = 250
+            self.factor_horizon = 1
+            self.factor_threshold = 60.0
+            self.factor_exclude_st = True
+            self.factor_exclude_limit = True
+            self.factor_show_n = 50
         self.interval = max(3, min(3600, self.interval))
 
     def _save_config(self):
@@ -941,7 +988,14 @@ class StockMonitorApp:
                 json.dump({"watchlist": self.watchlist, "interval": self.interval,
                            "cn_color": self.cn_color,
                            "wencai_cookie": getattr(self, "wencai_cookie", ""),
-                           "wencai_last_query": getattr(self, "wencai_last_query", "")},
+                           "wencai_last_query": getattr(self, "wencai_last_query", ""),
+                           "factor_limit": getattr(self, "factor_limit", 300),
+                           "factor_lookback": getattr(self, "factor_lookback", 250),
+                           "factor_horizon": getattr(self, "factor_horizon", 1),
+                           "factor_threshold": getattr(self, "factor_threshold", 60.0),
+                           "factor_exclude_st": getattr(self, "factor_exclude_st", True),
+                           "factor_exclude_limit": getattr(self, "factor_exclude_limit", True),
+                           "factor_show_n": getattr(self, "factor_show_n", 50)},
                           f, ensure_ascii=False, indent=2)
         except Exception as e:
             print("配置保存失败:", e)
@@ -960,14 +1014,17 @@ class StockMonitorApp:
         self.nb = nb
         self.tab_watch = ttk.Frame(nb)
         self.tab_screen = ttk.Frame(nb)
+        self.tab_factor = ttk.Frame(nb)
         self.tab_feed = ttk.Frame(nb)
         self.tab_wencai = ttk.Frame(nb)
         nb.add(self.tab_watch, text="  自选盯盘  ")
         nb.add(self.tab_screen, text="  选股器(A股)  ")
+        nb.add(self.tab_factor, text="  因子选股  ")
         nb.add(self.tab_feed, text="  7x24快讯  ")
         nb.add(self.tab_wencai, text="  问财选股  ")
         self._build_watch_tab()
         self._build_screen_tab()
+        self._build_factor_tab()
         self._build_feed_tab()
         self._build_wencai_tab()
 
@@ -1885,6 +1942,456 @@ class StockMonitorApp:
         if url:
             webbrowser.open(url)
 
+    # ================ 因子选股 ================
+    def _build_factor_tab(self):
+        top = ttk.Frame(self.tab_factor, padding=(8, 6))
+        top.pack(fill="x")
+        ttk.Label(top, text="因子选股", font=("Microsoft YaHei", 11, "bold")).pack(side="left")
+        ttk.Label(top, text="  股票池(成交额前)").pack(side="left")
+        self.factor_limit_var = tk.StringVar(value=str(self.factor_limit))
+        ttk.Combobox(top, textvariable=self.factor_limit_var, width=6, state="readonly",
+                     values=("150", "300", "500")).pack(side="left", padx=2)
+        ttk.Label(top, text="只  回看").pack(side="left")
+        self.factor_lookback_var = tk.StringVar(value=str(self.factor_lookback))
+        ttk.Combobox(top, textvariable=self.factor_lookback_var, width=6, state="readonly",
+                     values=("120", "250")).pack(side="left", padx=2)
+        ttk.Label(top, text="日  预测").pack(side="left")
+        self.factor_horizon_var = tk.StringVar(value=str(self.factor_horizon))
+        ttk.Combobox(top, textvariable=self.factor_horizon_var, width=4, state="readonly",
+                     values=("1", "5")).pack(side="left", padx=2)
+        ttk.Label(top, text="日").pack(side="left")
+        self.factor_exclude_st_var = tk.BooleanVar(value=self.factor_exclude_st)
+        ttk.Checkbutton(top, text="排除ST", variable=self.factor_exclude_st_var).pack(side="left", padx=6)
+        self.factor_exclude_limit_var = tk.BooleanVar(value=self.factor_exclude_limit)
+        ttk.Checkbutton(top, text="排除涨停", variable=self.factor_exclude_limit_var).pack(side="left", padx=2)
+        ttk.Label(top, text="  得分≥").pack(side="left")
+        self.factor_threshold_var = tk.StringVar(value=f"{self.factor_threshold:g}")
+        ttk.Entry(top, textvariable=self.factor_threshold_var, width=5).pack(side="left")
+        self.factor_run_btn = ttk.Button(top, text="运行", command=self._run_factor)
+        self.factor_run_btn.pack(side="left", padx=6)
+        self.factor_cancel_btn = ttk.Button(top, text="取消", command=self._factor_cancel_cmd,
+                                            state="disabled")
+        self.factor_cancel_btn.pack(side="left", padx=2)
+
+        info = ttk.Frame(self.tab_factor, padding=(8, 0))
+        info.pack(fill="x")
+        self.factor_status_var = tk.StringVar(
+            value="点击「运行」: 抓取成交额前 N 只日K, 计算 RankIC/ICIR 并做样本外检验")
+        ttk.Label(info, textvariable=self.factor_status_var, foreground="#333").pack(side="left")
+        ttk.Label(info, text="股票池=今日成交额前N · Top20模拟计成本/剔涨停 · 历史IC含选择偏差 · 仅供研究",
+                  foreground="#999").pack(side="right")
+
+        paned = ttk.Panedwindow(self.tab_factor, orient="vertical")
+        paned.pack(fill="both", expand=True, padx=8, pady=(4, 6))
+
+        sf = ttk.LabelFrame(paned, text="因子有效性 (RankIC / ICIR / 样本外)", padding=(4, 2))
+        fcols = ("name", "category", "mean_ic", "icir", "t", "coverage",
+                 "recent_ic", "win_rate", "direction", "weight", "status")
+        fheaders = ("因子", "类别", "平均IC", "ICIR", "t值", "覆盖率",
+                    "近20日IC", "IC胜率", "方向", "权重", "状态")
+        fwidths = (150, 62, 66, 58, 52, 58, 68, 60, 50, 58, 190)
+        self.factor_stat_cols = fcols
+        self.factor_stat_headers = dict(zip(fcols, fheaders))
+        self.fstats_tree = ttk.Treeview(sf, columns=fcols, show="headings", height=8)
+        for c, h, w in zip(fcols, fheaders, fwidths):
+            self.fstats_tree.heading(c, text=h, command=lambda col=c: self._sort_factor_stats(col))
+            self.fstats_tree.column(c, width=w, anchor="e")
+        for c in ("name", "category", "status"):
+            self.fstats_tree.column(c, anchor="w")
+        fsb = ttk.Scrollbar(sf, orient="vertical", command=self.fstats_tree.yview)
+        self.fstats_tree.configure(yscrollcommand=fsb.set)
+        self.fstats_tree.pack(side="left", fill="both", expand=True)
+        fsb.pack(side="right", fill="y")
+        self.fstats_tree.tag_configure("sel", background="#eef7ee")
+        self.fstats_tree.tag_configure("off", foreground="#888")
+        paned.add(sf, weight=1)
+
+        rf = ttk.LabelFrame(paned, text="筛选结果 (按因子得分排序)", padding=(4, 2))
+        rf_top = ttk.Frame(rf)
+        rf_top.pack(fill="x")
+        ttk.Label(rf_top, text="显示前").pack(side="left")
+        self.factor_show_var = tk.StringVar(value=str(self.factor_show_n))
+        ttk.Combobox(rf_top, textvariable=self.factor_show_var, width=5, state="readonly",
+                     values=("20", "50", "100")).pack(side="left", padx=2)
+        ttk.Label(rf_top, text="只 · 点击表头排序 · 双击打开详情 · 右键复制/资讯/公告",
+                  foreground="#999").pack(side="left", padx=6)
+        self.factor_show_var.trace_add("write", lambda *a: self._render_factor_results())
+
+        rcols = ("rank", "code", "name", "price", "pct", "score", "mom", "trend",
+                 "vol", "liq", "pattern", "market", "top", "industry", "asof")
+        rheaders = ("排名", "代码", "名称", "现价", "涨跌幅", "因子得分", "动量", "趋势",
+                    "波动", "流动性", "形态", "市场", "主要贡献", "行业", "数据日")
+        rwidths = (44, 66, 96, 70, 68, 66, 52, 52, 52, 56, 52, 52, 210, 80, 80)
+        self.factor_cols = rcols
+        self.factor_headers = dict(zip(rcols, rheaders))
+        rbox = ttk.Frame(rf)
+        rbox.pack(fill="both", expand=True)
+        self.factor_tree = ttk.Treeview(rbox, columns=rcols, show="headings")
+        for c, h, w in zip(rcols, rheaders, rwidths):
+            self.factor_tree.heading(c, text=h, command=lambda col=c: self._sort_factor_results(col))
+            self.factor_tree.column(c, width=w, anchor="e")
+        for c in ("code", "name", "top", "industry"):
+            self.factor_tree.column(c, anchor="w")
+        rysb = ttk.Scrollbar(rbox, orient="vertical", command=self.factor_tree.yview)
+        rxsb = ttk.Scrollbar(rbox, orient="horizontal", command=self.factor_tree.xview)
+        self.factor_tree.configure(yscrollcommand=rysb.set, xscrollcommand=rxsb.set)
+        self.factor_tree.grid(row=0, column=0, sticky="nsew")
+        rysb.grid(row=0, column=1, sticky="ns")
+        rxsb.grid(row=1, column=0, sticky="ew")
+        rbox.rowconfigure(0, weight=1)
+        rbox.columnconfigure(0, weight=1)
+        self.factor_tree.tag_configure("up", foreground=COLOR_UP_DEFAULT)
+        self.factor_tree.tag_configure("down", foreground=COLOR_DOWN_DEFAULT)
+        self.factor_tree.tag_configure("flat", foreground=COLOR_FLAT)
+        self.factor_tree.tag_configure("hot", background="#eef7ee")
+        self.factor_tree.bind("<Double-1>", self._open_factor_detail)
+        self.factor_tree.bind("<Button-3>", self._on_factor_right_click)
+        paned.add(rf, weight=3)
+
+    def _sync_factor_settings(self):
+        if not hasattr(self, "factor_limit_var"):
+            return
+
+        def iv(var, default):
+            try:
+                return int(var.get())
+            except (TypeError, ValueError):
+                return default
+
+        def fv(var, default):
+            try:
+                return float(var.get())
+            except (TypeError, ValueError):
+                return default
+
+        self.factor_limit = max(50, min(800, iv(self.factor_limit_var, self.factor_limit)))
+        self.factor_lookback = max(80, min(300, iv(self.factor_lookback_var, self.factor_lookback)))
+        self.factor_horizon = 5 if iv(self.factor_horizon_var, self.factor_horizon) == 5 else 1
+        self.factor_threshold = max(0.0, min(100.0, fv(self.factor_threshold_var,
+                                                       self.factor_threshold)))
+        self.factor_exclude_st = bool(self.factor_exclude_st_var.get())
+        self.factor_exclude_limit = bool(self.factor_exclude_limit_var.get())
+        self.factor_show_n = max(20, min(100, iv(self.factor_show_var, self.factor_show_n)))
+
+    def _run_factor(self):
+        if self._factor_busy:
+            return
+        if factor_engine is None:
+            messagebox.showerror("因子引擎不可用",
+                                 "未找到 factor_engine.py, 请确认它与 stock_monitor.py 同目录")
+            return
+        self._sync_factor_settings()
+        limit = self.factor_limit
+        lookback = self.factor_lookback
+        horizon = self.factor_horizon
+        exclude_st = self.factor_exclude_st
+        exclude_limit = self.factor_exclude_limit
+        threshold = self.factor_threshold
+        self._factor_busy = True
+        self._factor_cancel.clear()
+        self.factor_run_btn.configure(state="disabled")
+        self.factor_cancel_btn.configure(state="normal")
+        self.factor_status_var.set("准备运行...")
+
+        def progress(_stage, _done, _total, msg):
+            self._factor_queue.put(("progress", msg))
+
+        def work():
+            try:
+                result = factor_engine.run_factor_screen(
+                    limit=limit, lookback=lookback, horizon=horizon,
+                    exclude_st=exclude_st, exclude_limit_up=exclude_limit,
+                    threshold=threshold,
+                    workers=4, progress_cb=progress,
+                    cancel_event=self._factor_cancel)
+                self._factor_queue.put(("done", result))
+            except factor_engine.Cancelled:
+                self._factor_queue.put(("cancelled",))
+            except Exception as e:
+                self._factor_queue.put(("error", str(e)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _factor_cancel_cmd(self):
+        if not self._factor_busy:
+            return
+        self._factor_cancel.set()
+        self.factor_cancel_btn.configure(state="disabled")
+        self.factor_status_var.set("正在取消 (等待当前网络请求结束)...")
+
+    def _factor_pump(self):
+        try:
+            while True:
+                item = self._factor_queue.get_nowait()
+                kind = item[0]
+                if kind == "progress":
+                    self.factor_status_var.set(item[1])
+                elif kind == "done":
+                    self._factor_done(item[1])
+                elif kind == "error":
+                    self._factor_error(item[1])
+                elif kind == "cancelled":
+                    self._factor_cancelled()
+                elif kind == "industry":
+                    self._factor_apply_industry(item[1])
+        except queue.Empty:
+            pass
+        try:
+            self.root.after(300, self._factor_pump)
+        except Exception:
+            pass
+
+    def _factor_done(self, result):
+        self.factor_rows = result.get("stocks") or []
+        self.factor_stats = result.get("factor_stats") or []
+        self.factor_meta = result.get("meta") or {}
+        self.factor_wf = result.get("walk_forward") or {}
+        self.factor_sort_col = None
+        self.factor_sort_desc = True
+        self.factor_stat_sort_col = None
+        self.factor_stat_sort_desc = True
+        self._update_factor_stat_headings()
+        self._update_factor_result_headings()
+        self._render_factor_stats()
+        self._render_factor_results()
+        self._factor_busy = False
+        self.factor_run_btn.configure(state="normal")
+        self.factor_cancel_btn.configure(state="disabled")
+        self.factor_status_var.set(self._factor_summary_text())
+        self._save_config()
+        self._start_factor_industry_fill()
+
+    def _factor_error(self, msg):
+        self._factor_busy = False
+        self.factor_run_btn.configure(state="normal")
+        self.factor_cancel_btn.configure(state="disabled")
+        self.factor_status_var.set(f"运行失败: {msg}")
+
+    def _factor_cancelled(self):
+        self._factor_busy = False
+        self.factor_run_btn.configure(state="normal")
+        self.factor_cancel_btn.configure(state="disabled")
+        self.factor_status_var.set("已取消")
+
+    def _factor_summary_text(self):
+        meta = self.factor_meta or {}
+        wf = self.factor_wf or {}
+        oos = (wf.get("oos") or {}).get("mean_ic")
+        eq = (wf.get("equal_oos") or {}).get("mean_ic")
+        parts = [f"候选 {len(self.factor_rows)} 只",
+                 f"入选因子 {meta.get('selected', 0)}/{len(self.factor_stats)}",
+                 f"截至 {meta.get('asof') or '--'}"]
+        if oos is not None:
+            parts.append(f"样本外IC {oos:+.3f}")
+        if eq is not None:
+            parts.append(f"等权基准 {eq:+.3f}")
+        pf = wf.get("portfolio") or {}
+        if pf.get("n_dates"):
+            parts.append(f"Top{pf['top_k']} {pf['cum']:+.1%} vs {pf['bench_cum']:+.1%}")
+            if pf.get("sharpe") is not None:
+                parts.append(f"夏普 {pf['sharpe']:.2f}")
+        if meta.get("elapsed") is not None:
+            parts.append(f"{meta['elapsed']:.0f}s")
+        text = " · ".join(parts)
+        warns = list(meta.get("warnings") or [])
+        if oos is not None and eq is not None and oos < eq:
+            warns.append("样本外未跑赢等权基准")
+        if warns:
+            text += " · " + "；".join(warns)
+        return text
+
+    def _start_factor_industry_fill(self):
+        rows = self.factor_rows[:50]
+        if not rows:
+            return
+
+        def work():
+            mapping = {}
+
+            def one(r):
+                try:
+                    return r.get("symbol"), fetch_industry(r.get("symbol"))
+                except Exception:
+                    return r.get("symbol"), "—"
+
+            with ThreadPoolExecutor(max_workers=12) as ex:
+                for sym, ind in ex.map(one, rows):
+                    if sym:
+                        mapping[sym] = ind
+            self._factor_queue.put(("industry", mapping))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _factor_apply_industry(self, mapping):
+        if not mapping:
+            return
+        for r in self.factor_rows:
+            ind = mapping.get(r.get("symbol"))
+            if ind:
+                r["industry"] = ind
+        _save_industry_cache()
+        self._render_factor_results()
+
+    def _factor_stat_sort_value(self, r, col):
+        key = {"name": "label", "category": "category_label", "mean_ic": "mean_ic",
+               "icir": "icir", "t": "t", "coverage": "coverage",
+               "recent_ic": "recent_ic", "win_rate": "win_rate",
+               "direction": "sign", "weight": "weight", "status": "status"}.get(col)
+        val = r.get(key)
+        if col in ("mean_ic", "icir", "t", "coverage", "recent_ic",
+                   "win_rate", "direction", "weight"):
+            return val
+        return val or ""
+
+    def _apply_factor_stats_sort(self):
+        col = self.factor_stat_sort_col
+        if not col or not self.factor_stats:
+            return
+        keyed = [(self._factor_stat_sort_value(r, col), r) for r in self.factor_stats]
+        present = [(v, r) for v, r in keyed if v is not None]
+        missing = [r for v, r in keyed if v is None]
+        present.sort(key=lambda t: t[0], reverse=self.factor_stat_sort_desc)
+        self.factor_stats = [r for _v, r in present] + missing
+
+    def _update_factor_stat_headings(self):
+        for c in self.factor_stat_cols:
+            base = self.factor_stat_headers[c]
+            if c == self.factor_stat_sort_col:
+                self.fstats_tree.heading(c, text=base + (" ▼" if self.factor_stat_sort_desc else " ▲"))
+            else:
+                self.fstats_tree.heading(c, text=base)
+
+    def _sort_factor_stats(self, col):
+        if self.factor_stat_sort_col == col:
+            self.factor_stat_sort_desc = not self.factor_stat_sort_desc
+        else:
+            self.factor_stat_sort_col = col
+            self.factor_stat_sort_desc = True
+        self._apply_factor_stats_sort()
+        self._update_factor_stat_headings()
+        self._render_factor_stats()
+
+    def _render_factor_stats(self):
+        self.fstats_tree.delete(*self.fstats_tree.get_children())
+        for r in self.factor_stats:
+            ic = r.get("mean_ic")
+            icir = r.get("icir")
+            t = r.get("t")
+            recent = r.get("recent_ic")
+            win = r.get("win_rate")
+            sign = r.get("sign") or 0
+            w = r.get("weight") or 0.0
+            vals = (
+                r.get("label") or r.get("key") or "",
+                r.get("category_label") or "",
+                "--" if ic is None else f"{ic:+.4f}",
+                "--" if icir is None else f"{icir:+.2f}",
+                "--" if t is None else f"{t:+.1f}",
+                f"{(r.get('coverage') or 0) * 100:.0f}%",
+                "--" if recent is None else f"{recent:+.4f}",
+                "--" if win is None else f"{win * 100:.0f}%",
+                "正向" if sign > 0 else ("反向" if sign < 0 else "—"),
+                f"{w * 100:+.1f}%",
+                r.get("status") or "",
+            )
+            tags = ("sel",) if w else ("off",)
+            self.fstats_tree.insert("", "end", iid=r.get("key"), values=vals, tags=tags)
+
+    def _factor_result_sort_value(self, r, col):
+        if col in ("rank", "price", "pct", "score", "coverage"):
+            return r.get(col)
+        cat_key = {"mom": "momentum", "trend": "trend", "vol": "volatility",
+                   "liq": "liquidity", "pattern": "pattern", "market": "market"}.get(col)
+        if cat_key:
+            return (r.get("cat_scores") or {}).get(cat_key)
+        return r.get(col) or ""
+
+    def _apply_factor_result_sort(self):
+        col = self.factor_sort_col
+        if not col or not self.factor_rows:
+            return
+        keyed = [(self._factor_result_sort_value(r, col), r) for r in self.factor_rows]
+        present = [(v, r) for v, r in keyed if v is not None]
+        missing = [r for v, r in keyed if v is None]
+        present.sort(key=lambda t: t[0], reverse=self.factor_sort_desc)
+        self.factor_rows = [r for _v, r in present] + missing
+
+    def _update_factor_result_headings(self):
+        for c in self.factor_cols:
+            base = self.factor_headers[c]
+            if c == self.factor_sort_col:
+                self.factor_tree.heading(c, text=base + (" ▼" if self.factor_sort_desc else " ▲"))
+            else:
+                self.factor_tree.heading(c, text=base)
+
+    def _sort_factor_results(self, col):
+        if self.factor_sort_col == col:
+            self.factor_sort_desc = not self.factor_sort_desc
+        else:
+            self.factor_sort_col = col
+            self.factor_sort_desc = True
+        self._apply_factor_result_sort()
+        self._update_factor_result_headings()
+        self._render_factor_results()
+
+    def _factor_show_n(self):
+        try:
+            return max(20, min(100, int(self.factor_show_var.get())))
+        except (TypeError, ValueError):
+            return 50
+
+    def _render_factor_results(self):
+        self.factor_tree.delete(*self.factor_tree.get_children())
+        if not self.factor_rows:
+            return
+        cat_keys = (("mom", "momentum"), ("trend", "trend"), ("vol", "volatility"),
+                    ("liq", "liquidity"), ("pattern", "pattern"), ("market", "market"))
+
+        def cat_text(r, key):
+            v = (r.get("cat_scores") or {}).get(key)
+            return "--" if v is None else f"{v:.0f}"
+
+        for r in self.factor_rows[:self._factor_show_n()]:
+            score = r.get("score")
+            pct = r.get("pct")
+            label = "up" if (pct or 0) > 0 else ("down" if (pct or 0) < 0 else "flat")
+            tags = (label,)
+            if score is not None and score >= 80:
+                tags = ("hot",) + tags
+            vals = (
+                r.get("rank") or "",
+                r.get("code") or "",
+                r.get("name") or "",
+                fmt_price(r.get("price")),
+                fmt_pct(pct),
+                "--" if score is None else f"{score:.1f}",
+            ) + tuple(cat_text(r, k) for _c, k in cat_keys) + (
+                r.get("top") or "—",
+                r.get("industry") or "—",
+                r.get("asof") or "—",
+            )
+            self.factor_tree.insert("", "end", values=vals, tags=tags)
+
+    def _open_factor_detail(self, _event):
+        sel = self.factor_tree.selection()
+        if not sel:
+            return
+        vals = self.factor_tree.item(sel[0], "values")
+        if len(vals) < 2:
+            return
+        c = classify_symbol(str(vals[1]))
+        if c:
+            webbrowser.open(detail_url(c[2], c[1]))
+
+    def _on_factor_right_click(self, event):
+        row = self.factor_tree.identify_row(event.y)
+        if not row:
+            return
+        self.factor_tree.selection_set(row)
+        vals = self.factor_tree.item(row, "values")
+        if len(vals) >= 2:
+            self._show_context_menu(event, str(vals[1]))
+
     # ================ 7x24快讯 ================
     def _build_feed_tab(self):
         ctrl = ttk.Frame(self.tab_feed, padding=(8, 6))
@@ -2168,6 +2675,8 @@ class StockMonitorApp:
     # ---------------- 关闭 ----------------
     def _on_close(self):
         self._stop = True
+        self._factor_cancel.set()
+        self._sync_factor_settings()
         self._save_config()
         _save_industry_cache()
         _save_kline_cache()
