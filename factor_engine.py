@@ -32,6 +32,7 @@ import sys
 import threading
 import time
 import urllib.request
+import urllib.parse
 from array import array
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -40,8 +41,28 @@ UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 SINA_HDR = {"User-Agent": UA["User-Agent"], "Referer": "https://finance.sina.com.cn/"}
 SINA_LIST_URL = ("https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/"
                  "Market_Center.getHQNodeData?page={page}&num={num}&sort=amount&asc=0"
-                 "&node=hs_a&symbol=")
+                 "&node={node}&symbol=")
 KLINE_URL = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={sym},day,,,{n},qfq"
+BINANCE_ALL_URL = "https://api.binance.com/api/v3/ticker/24hr"
+BINANCE_KLINES_URL = ("https://api.binance.com/api/v3/klines?"
+                      "symbol={sym}&interval=1d&limit={n}")
+OKX_CANDLES_URL = "https://www.okx.com/api/v5/market/candles?instId={inst}&bar=1D&limit={n}"
+NASDAQ_SCREENER_URL = ("https://api.nasdaq.com/api/screener/stocks?"
+                       "tableonly=true&limit=25&offset=0&download=true")
+NASDAQ_HIST_URL = ("https://api.nasdaq.com/api/quote/{sym}/historical?"
+                   "assetclass=stocks&fromdate={fromdate}&limit={n}")
+YAHOO_DAILY_URL = ("https://query1.finance.yahoo.com/v8/finance/chart/"
+                   "{sym}?interval=1d&range=2y")
+US_FALLBACK = [
+    "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "AVGO", "AMD",
+    "NFLX", "JPM", "V", "MA", "COST", "HD", "UNH", "XOM", "JNJ", "WMT", "PG",
+    "LLY", "ORCL", "CRM", "ADBE", "CSCO", "INTC", "QCOM", "TXN", "MU", "AMAT",
+    "BAC", "WFC", "GS", "MS", "C", "BLK", "SPGI", "CAT", "DE", "GE",
+]
+CRYPTO_STABLE = {
+    "USDC", "FDUSD", "TUSD", "DAI", "USDP", "BUSD", "EUR", "AEUR", "USDD",
+    "PYUSD", "USD1", "XAUT", "PAXG", "RLUSD",
+}
 KLINE_HDR = {"User-Agent": UA["User-Agent"], "Referer": "https://gu.qq.com/"}
 SINA_KLINE_URL = ("https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
                   "CN_MarketData.getKLineData?symbol={sym}&scale=240&ma=no&datalen={n}")
@@ -264,14 +285,14 @@ def _emit(progress_cb, stage, done, total, msg):
 # 数据抓取与缓存
 # ---------------------------------------------------------------------------
 
-def fetch_sina_universe(limit=300, exclude_st=True):
-    """今日成交额降序的 A 股股票池。"""
+def fetch_sina_universe(limit=300, exclude_st=True, node="hs_a", market="a"):
+    """成交额降序的 A 股/ETF 池。"""
     out = []
     seen = set()
     page = 1
     max_page = max(2, int(limit / 100) + 3)
     while len(out) < limit and page <= max_page:
-        url = SINA_LIST_URL.format(page=page, num=100)
+        url = SINA_LIST_URL.format(page=page, num=100, node=node)
         try:
             raw = _http(url, SINA_HDR, timeout=12)
             arr = json.loads(raw.decode("utf-8", "replace"))
@@ -285,6 +306,10 @@ def fetch_sina_universe(limit=300, exclude_st=True):
                 continue
             name = str(r.get("name") or "")
             if exclude_st and ("ST" in name.upper() or "退" in name):
+                continue
+            if node == "etf_hq_fund" and any(
+                    k in name for k in ("货币", "日利", "短融", "现金", "债", "添益",
+                                       "理财", "保证金", "快线", "国开", "政金")):
                 continue
             price = _to_float(r.get("trade"))
             amount = _to_float(r.get("amount"))
@@ -303,6 +328,7 @@ def fetch_sina_universe(limit=300, exclude_st=True):
                 "low": _to_float(r.get("low")),
                 "open": _to_float(r.get("open")),
                 "volume": _to_float(r.get("volume")),
+                "market": market,
             })
             if len(out) >= limit:
                 break
@@ -396,6 +422,210 @@ def fetch_daily_bars(symbol, n=320):
     return bars
 
 
+def fetch_crypto_universe(limit=120):
+    """Binance USDT 现货按 24h 成交额排序, 过滤稳定币/杠杆代币。"""
+    raw = _http(BINANCE_ALL_URL, UA, timeout=20)
+    arr = json.loads(raw.decode("utf-8", "replace"))
+    rows = []
+    for x in arr if isinstance(arr, list) else []:
+        pair = str(x.get("symbol") or "")
+        if not pair.endswith("USDT"):
+            continue
+        base = pair[:-4]
+        if base in CRYPTO_STABLE:
+            continue
+        lev = False
+        for suf in ("UP", "DOWN", "BULL", "BEAR", "3L", "3S"):
+            if base.endswith(suf) and len(base) - len(suf) >= 2:
+                lev = True
+                break
+        if lev:
+            continue
+        qv = _to_float(x.get("quoteVolume"), 0)
+        price = _to_float(x.get("lastPrice"))
+        if not qv or price is None or qv < 5e6:
+            continue
+        rows.append({
+            "symbol": "cr" + pair, "code": base, "name": base,
+            "price": price, "pct": _to_float(x.get("priceChangePercent")),
+            "amount": qv, "turnover": None, "market": "crypto",
+        })
+    rows.sort(key=lambda r: r["amount"], reverse=True)
+    return rows[:limit]
+
+
+def _fetch_crypto_bars_src(pair, n=320):
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    try:
+        raw = _http(BINANCE_KLINES_URL.format(sym=pair, n=n), UA, timeout=10)
+        arr = json.loads(raw.decode("utf-8", "replace"))
+        rows = []
+        for k in arr if isinstance(arr, list) else []:
+            if not isinstance(k, (list, tuple)) or len(k) < 6:
+                continue
+            date = time.strftime("%Y-%m-%d", time.gmtime(float(k[0]) / 1000.0))
+            o, c, h, l, v = (_to_float(k[1]), _to_float(k[4]), _to_float(k[2]),
+                             _to_float(k[3]), _to_float(k[5], 0))
+            if None in (o, c, h, l) or c <= 0:
+                continue
+            rows.append((date, o, c, h, l, v))
+        rows = [r for r in rows if r[0] <= today]
+        if rows and rows[-1][0] == today:
+            rows = rows[:-1]
+        if rows:
+            return rows, "binance"
+    except Exception:
+        pass
+    try:
+        inst = pair[:-4] + "-USDT" if pair.endswith("USDT") else pair
+        raw = _http(OKX_CANDLES_URL.format(inst=inst, n=n), UA, timeout=10)
+        data = json.loads(raw.decode("utf-8", "replace"))
+        rows = []
+        for k in (data.get("data") or []):
+            if len(k) < 6:
+                continue
+            date = time.strftime("%Y-%m-%d", time.gmtime(float(k[0]) / 1000.0))
+            o, c, h, l, v = (_to_float(k[1]), _to_float(k[4]), _to_float(k[2]),
+                             _to_float(k[3]), _to_float(k[5], 0))
+            if None in (o, c, h, l) or c <= 0:
+                continue
+            rows.append((date, o, c, h, l, v))
+        rows.sort(key=lambda r: r[0])
+        rows = [r for r in rows if r[0] <= today]
+        if rows and rows[-1][0] == today:
+            rows = rows[:-1]
+        return rows, "okx"
+    except Exception:
+        return [], ""
+
+
+def fetch_crypto_bars(pair, n=320):
+    return _fetch_crypto_bars_src(pair, n)[0]
+
+
+def _us_money(v):
+    x = str(v or "").replace("$", "").replace(",", "").replace("%", "").strip()
+    if x in ("", "N/A", "--", "-"):
+        return None
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def fetch_us_universe(limit=150):
+    """Nasdaq screener 全美股列表, 按市值排序。"""
+    hdr = {"User-Agent": UA["User-Agent"], "Referer": "https://www.nasdaq.com/",
+           "Accept": "application/json, text/plain, */*"}
+    raw = _http(NASDAQ_SCREENER_URL, hdr, timeout=20)
+    data = json.loads(raw.decode("utf-8", "replace"))
+    rows = (((data.get("data") or {}).get("rows")) or [])
+    out = []
+    for r in rows:
+        sym = str(r.get("symbol") or "").strip()
+        price = _us_money(r.get("lastsale"))
+        volume = _us_money(r.get("volume")) or 0
+        cap = _us_money(r.get("marketCap")) or 0
+        if not sym or price is None or price <= 0 or volume <= 0:
+            continue
+        out.append({
+            "symbol": "us" + sym, "code": sym,
+            "name": str(r.get("name") or sym), "price": price,
+            "pct": _us_money(r.get("pctchange")), "amount": volume * price,
+            "volume": volume, "high": None, "low": None, "open": None,
+            "market_cap": cap, "sector": r.get("sector"),
+            "industry": r.get("industry"),
+            "turnover": None, "market": "us",
+        })
+    out.sort(key=lambda x: x["amount"], reverse=True)
+    return out[:limit]
+
+
+def _yahoo_daily_bars(sym, n=320):
+    url_sym = urllib.parse.quote(str(sym).replace(".", "-"), safe="")
+    raw = _http(YAHOO_DAILY_URL.format(sym=url_sym), UA, timeout=10)
+    res = ((json.loads(raw.decode("utf-8", "replace")).get("chart") or {})
+           .get("result") or [])
+    if not res:
+        return []
+    meta = res[0].get("meta") or {}
+    ts = res[0].get("timestamp") or []
+    q = (res[0].get("indicators", {}).get("quote") or [{}])[0]
+    closes = q.get("close") or []
+    opens = q.get("open") or []
+    highs = q.get("high") or []
+    lows = q.get("low") or []
+    vols = q.get("volume") or []
+    off = int(meta.get("gmtoffset") or 0)
+    out = []
+    for i, t in enumerate(ts):
+        c = closes[i] if i < len(closes) else None
+        if c is None:
+            continue
+        o = opens[i] if i < len(opens) else c
+        h = highs[i] if i < len(highs) else c
+        l = lows[i] if i < len(lows) else c
+        v = vols[i] if i < len(vols) else 0
+        if None in (o, h, l) or c <= 0:
+            continue
+        date = time.strftime("%Y-%m-%d", time.gmtime(float(t) + off))
+        out.append((date, float(o), float(c), float(h), float(l), float(v or 0)))
+    out.sort(key=lambda x: x[0])
+    return out[-n:]
+
+
+def _nasdaq_daily_bars(sym, n=320):
+    fromdate = time.strftime("%Y-%m-%d", time.localtime(time.time() - max(60, n * 2) * 86400))
+    hdr = {"User-Agent": UA["User-Agent"], "Referer": "https://www.nasdaq.com/",
+           "Accept": "application/json, text/plain, */*"}
+    raw = _http(NASDAQ_HIST_URL.format(sym=sym, fromdate=fromdate, n=n), hdr, timeout=15)
+    rows = (((json.loads(raw.decode("utf-8", "replace")).get("data") or {})
+             .get("tradesTable") or {}).get("rows") or [])
+    out = []
+    for r in rows:
+        try:
+            dt = time.strptime(str(r.get("date") or ""), "%m/%d/%Y")
+            date = time.strftime("%Y-%m-%d", dt)
+        except Exception:
+            continue
+        c = _us_money(r.get("close"))
+        if c is None:
+            continue
+        out.append((date, _us_money(r.get("open")) or c, c,
+                    _us_money(r.get("high")) or c, _us_money(r.get("low")) or c,
+                    _us_money(r.get("volume")) or 0))
+    out.sort(key=lambda x: x[0])
+    return out[-n:]
+
+
+def _fetch_us_bars_src(sym, n=320):
+    try:
+        bars = _yahoo_daily_bars(sym, n)
+        if bars:
+            return bars, "yahoo"
+    except Exception:
+        pass
+    try:
+        bars = _nasdaq_daily_bars(sym, n)
+        if bars:
+            return bars, "nasdaq"
+    except Exception:
+        pass
+    return [], ""
+
+
+def fetch_us_bars(sym, n=320):
+    return _fetch_us_bars_src(sym, n)[0]
+
+
+def fetch_us_index_bars(n=320):
+    for sym in ("^GSPC", "SPY"):
+        bars = _yahoo_daily_bars(sym, n)
+        if bars:
+            return bars
+    return []
+
+
 def fetch_index_bars(n=320):
     for sym in (INDEX_SYMBOL, "sh000001"):
         bars = fetch_daily_bars(sym, n)
@@ -437,12 +667,13 @@ def _save_cache(cache, path=CACHE_FILE):
 
 
 def fetch_universe_bars(symbols, n=320, cache=None, workers=4,
-                        progress_cb=None, cancel_event=None):
-    """并发抓取股票池日K(腾讯优先, 新浪回退); 返回 (bars_by_symbol, cache_hits, sources)。"""
+                        progress_cb=None, cancel_event=None, market="a"):
+    """并发抓取股票/币种日K; 返回 (bars_by_symbol, cache_hits, sources)。"""
     cache = cache if cache is not None else {"bars": {}, "miss": {}}
     now = time.time()
     result = {}
-    sources = {"tencent": 0, "sina": 0}
+    sources = {"tencent": 0, "sina": 0, "binance": 0, "okx": 0,
+               "yahoo": 0, "nasdaq": 0}
     hits = 0
     fails = 0
     lock = threading.Lock()
@@ -463,10 +694,19 @@ def fetch_universe_bars(symbols, n=320, cache=None, workers=4,
         _check(cancel_event)
         with throttle_lock:
             time.sleep(0.02 + random.random() * 0.04)
-        with lock:
-            use_tencent = time.time() >= tstate["off_until"]
-        bars, src, tencent_ok = _fetch_bars_with_source(
-            sym, n, prefer_tencent=use_tencent, throttle=False)
+        if market == "crypto":
+            bars, src = _fetch_crypto_bars_src(sym[2:], n)
+            tencent_ok = False
+            use_tencent = False
+        elif market == "us":
+            bars, src = _fetch_us_bars_src(sym[2:], n)
+            tencent_ok = False
+            use_tencent = False
+        else:
+            with lock:
+                use_tencent = time.time() >= tstate["off_until"]
+            bars, src, tencent_ok = _fetch_bars_with_source(
+                sym, n, prefer_tencent=use_tencent, throttle=False)
         if use_tencent:
             with lock:
                 if tencent_ok:
@@ -481,8 +721,8 @@ def fetch_universe_bars(symbols, n=320, cache=None, workers=4,
                 "ts": time.time(),
                 "n": len(bars),
                 "src": src,
-                "rows": [[b[0], round(b[1], 4), round(b[2], 4),
-                          round(b[3], 4), round(b[4], 4), int(b[5])] for b in bars],
+                "rows": [[b[0], round(b[1], 10), round(b[2], 10),
+                          round(b[3], 10), round(b[4], 10), round(b[5], 6)] for b in bars],
             }
             cache["miss"].pop(sym, None)
             return sym, bars, src, False
@@ -510,9 +750,16 @@ def fetch_universe_bars(symbols, n=320, cache=None, workers=4,
             else:
                 with lock:
                     fails += 1
-            _emit(progress_cb, "bars", i + 1, total,
-                  f"日K {i + 1}/{total} · 缓存 {hits} · 腾讯 {sources['tencent']}"
-                  f" · 新浪 {sources['sina']} · 失败 {fails}")
+            if market == "crypto":
+                msg = (f"日K {i + 1}/{total} · 缓存 {hits} · 币安 {sources['binance']}"
+                       f" · 欧易 {sources['okx']} · 失败 {fails}")
+            elif market == "us":
+                msg = (f"日K {i + 1}/{total} · 缓存 {hits} · Yahoo {sources['yahoo']}"
+                       f" · Nasdaq {sources['nasdaq']} · 失败 {fails}")
+            else:
+                msg = (f"日K {i + 1}/{total} · 缓存 {hits} · 腾讯 {sources['tencent']}"
+                       f" · 新浪 {sources['sina']} · 失败 {fails}")
+            _emit(progress_cb, "bars", i + 1, total, msg)
     return result, hits, sources
 
 
@@ -1280,7 +1527,7 @@ def _simulate_topk(panel, weights, date_indices, top_k=20, horizon=1,
 
 
 def walk_forward(panel, stats, ic_dates, split=0.7, top_k=20, horizon=1,
-                 **weight_kwargs):
+                 exclude_limit=True, **weight_kwargs):
     n = len(ic_dates)
     if n < 20:
         return {"weights": {}, "selected": {}, "sign_map": {},
@@ -1315,7 +1562,8 @@ def walk_forward(panel, stats, ic_dates, split=0.7, top_k=20, horizon=1,
     eq = {k: (1.0 if w > 0 else -1.0) / len(weights) for k, w in weights.items()}
     equal_oos = _eval_weights(panel, test_dates, eq)
     portfolio = _simulate_topk(panel, weights, test_dates,
-                               top_k=top_k, horizon=horizon)
+                               top_k=top_k, horizon=horizon,
+                               exclude_limit=exclude_limit)
     return {"weights": weights, "selected": meta, "sign_map": sign_map,
             "oos": oos, "equal_oos": equal_oos, "portfolio": portfolio,
             "train_dates": len(train_dates), "test_dates": len(test_dates),
@@ -1391,6 +1639,7 @@ def score_latest(panel, weights, universe_rows, threshold=None,
         pct = u.get("pct")
         if exclude_limit_up and pct is not None and pct >= _price_limit(sym) - 0.05:
             continue
+        vol20 = panel.values["realvol_20"][off + si]
         rows.append({
             "code": u.get("code") or sym[2:],
             "name": u.get("name") or "",
@@ -1404,6 +1653,7 @@ def score_latest(panel, weights, universe_rows, threshold=None,
             "cat_scores": cat_scores,
             "top": " ".join(top) if top else "—",
             "coverage": cov / float(len(weights)),
+            "vol20": vol20 if math.isfinite(vol20) else None,
             "asof": panel.dates[di],
             "industry": "…",
         })
@@ -1412,6 +1662,53 @@ def score_latest(panel, weights, universe_rows, threshold=None,
         r["rank"] = i + 1
     if threshold is not None:
         rows = [r for r in rows if r["score"] >= threshold]
+    return rows
+
+
+def annotate_advice(rows, wf, vol_cap=0.8):
+    """基于因子得分、横截面排名和样本外证据, 标注次日研究候选。
+    样本外 IC/组合超额不同时为正时, 不输出"强候选/候选", 最多"谨慎候选"。"""
+    oos = wf.get("oos") or {}
+    pf = wf.get("portfolio") or {}
+    oos_ic = oos.get("mean_ic")
+    excess = pf.get("excess")
+    evidence = (oos_ic is not None and oos_ic > 0
+                and (excess is None or excess > 0))
+    n = len(rows)
+    for r in rows:
+        score = r.get("score")
+        rank = r.get("rank") or 1
+        cov = r.get("coverage") or 0.0
+        pct_rank = 1.0 - (rank - 1) / float(max(1, n - 1))
+        label, reason = "观察", "得分中性"
+        if score is None or cov < 0.5:
+            label, reason = "数据不足", "因子覆盖不足"
+        elif evidence and score >= 75 and pct_rank >= 0.95:
+            label, reason = "强候选", "得分前5% + 样本外正向"
+        elif evidence and score >= 65 and pct_rank >= 0.85:
+            label, reason = "候选", "得分前15% + 样本外正向"
+        elif (not evidence) and score >= 72 and pct_rank >= 0.90:
+            label, reason = "谨慎候选", "得分靠前，但样本外证据不足"
+        elif score >= 55:
+            label, reason = "观察", "得分中性偏强"
+        else:
+            label, reason = "回避", "得分偏低"
+        vol = r.get("vol20")
+        if vol is not None and vol > vol_cap:
+            if label == "强候选":
+                label = "候选"
+                reason += "；20日波动偏高"
+            elif label == "候选":
+                label = "观察"
+                reason += "；20日波动偏高"
+            elif label == "谨慎候选":
+                reason += "；20日波动偏高"
+        pct = r.get("pct")
+        if pct is not None and pct >= 7:
+            reason += "；当日涨幅偏高"
+        r["advice"] = label
+        r["advice_reason"] = reason
+        r["evidence"] = "正向" if evidence else "不足"
     return rows
 
 
@@ -1429,12 +1726,41 @@ def _empty_factor_row(key):
 def run_factor_screen(limit=300, lookback=250, horizon=1, bars_n=320,
                       exclude_st=True, exclude_limit_up=True, threshold=None,
                       entry_lag=1, return_mode="open_to_close", workers=4,
-                      use_cache=True, progress_cb=None, cancel_event=None):
+                      use_cache=True, market="a", progress_cb=None,
+                      cancel_event=None):
     t0 = time.time()
-    _emit(progress_cb, "universe", 0, 1, "抓取成交额股票池...")
-    universe = fetch_sina_universe(limit, exclude_st)
+    if market == "crypto":
+        _emit(progress_cb, "universe", 0, 1, "抓取加密成交额池...")
+        universe = fetch_crypto_universe(limit)
+        exclude_limit_up = False
+    elif market == "etf":
+        _emit(progress_cb, "universe", 0, 1, "抓取 ETF 成交额池...")
+        universe = fetch_sina_universe(limit, exclude_st=False,
+                                       node="etf_hq_fund", market="etf")
+    elif market == "us":
+        _emit(progress_cb, "universe", 0, 1, "抓取美股列表...")
+        try:
+            universe = fetch_us_universe(limit)
+        except Exception:
+            universe = []
+        if not universe:
+            universe = [{"symbol": "us" + x, "code": x, "name": x,
+                         "price": None, "pct": None, "amount": 0,
+                         "turnover": None, "market": "us"}
+                        for x in US_FALLBACK[:limit]]
+        exclude_limit_up = False
+    elif market == "all":
+        _emit(progress_cb, "universe", 0, 1, "抓取个股+ETF成交额池...")
+        a_rows = fetch_sina_universe(limit, exclude_st, market="a")
+        e_rows = fetch_sina_universe(limit, exclude_st=False,
+                                     node="etf_hq_fund", market="etf")
+        universe = sorted(a_rows + e_rows,
+                          key=lambda r: r.get("amount") or 0, reverse=True)[:limit]
+    else:
+        _emit(progress_cb, "universe", 0, 1, "抓取成交额股票池...")
+        universe = fetch_sina_universe(limit, exclude_st, market="a")
     if not universe:
-        raise RuntimeError("股票池为空: 新浪接口失败或被限流")
+        raise RuntimeError("池为空: 数据接口失败或被限流")
     symbols = [u["symbol"] for u in universe]
     _check(cancel_event)
 
@@ -1442,7 +1768,7 @@ def run_factor_screen(limit=300, lookback=250, horizon=1, bars_n=320,
     _emit(progress_cb, "bars", 0, len(symbols), "抓取日K...")
     bars_by_symbol, cache_hits, sources = fetch_universe_bars(
         symbols, n=bars_n, cache=cache, workers=workers,
-        progress_cb=progress_cb, cancel_event=cancel_event)
+        progress_cb=progress_cb, cancel_event=cancel_event, market=market)
     if use_cache:
         _save_cache(cache)
     if len(bars_by_symbol) < 20:
@@ -1450,7 +1776,12 @@ def run_factor_screen(limit=300, lookback=250, horizon=1, bars_n=320,
     _check(cancel_event)
 
     _emit(progress_cb, "panel", 0, 1, "抓取指数并构建因子面板...")
-    index_bars = fetch_index_bars(bars_n)
+    if market == "crypto":
+        index_bars = fetch_crypto_bars("BTCUSDT", bars_n)
+    elif market == "us":
+        index_bars = fetch_us_index_bars(bars_n)
+    else:
+        index_bars = fetch_index_bars(bars_n)
     panel = build_panel(bars_by_symbol, index_bars, lookback=lookback,
                         horizon=horizon, entry_lag=entry_lag,
                         return_mode=return_mode, progress_cb=progress_cb,
@@ -1466,11 +1797,20 @@ def run_factor_screen(limit=300, lookback=250, horizon=1, bars_n=320,
         raise RuntimeError("没有足够的有效前瞻收益, 无法计算 IC")
     all_stats = summarize_ic(stats, len(ic_dates), len(panel.symbols))
 
-    wf = walk_forward(panel, stats, ic_dates, top_k=20, horizon=horizon)
+    wf = walk_forward(panel, stats, ic_dates, top_k=20, horizon=horizon,
+                      exclude_limit=exclude_limit_up)
     live_weights, live_meta = select_weights(
         panel, all_stats, ic_dates, sign_map=wf.get("sign_map"))
     stocks = score_latest(panel, live_weights, universe, threshold=threshold,
                           exclude_limit_up=exclude_limit_up)
+    stocks = annotate_advice(stocks, wf,
+                             vol_cap=1.5 if market == "crypto" else 0.8)
+    market_by_symbol = {u.get("symbol"): u.get("market", market) for u in universe}
+    for r in stocks:
+        r["market"] = market_by_symbol.get(r.get("symbol"), market)
+    n_strong = sum(1 for r in stocks if r.get("advice") == "强候选")
+    n_buy = sum(1 for r in stocks if r.get("advice") in ("强候选", "候选"))
+    n_caution = sum(1 for r in stocks if r.get("advice") == "谨慎候选")
 
     factor_rows = []
     for key in FACTOR_KEYS:
@@ -1503,18 +1843,44 @@ def run_factor_screen(limit=300, lookback=250, horizon=1, bars_n=320,
     elif wf["oos"]["mean_ic"] is not None and wf["oos"]["mean_ic"] <= 0:
         warnings.append("样本外RankIC不为正, 因子组合缺乏稳定证据")
     if len(panel.symbols) < 50:
-        warnings.append("有效股票数较少, 横截面统计不稳定")
+        warnings.append("有效标的数较少, 横截面统计不稳定")
     if len(ic_dates) < 40:
         warnings.append(f"有效IC日期仅{len(ic_dates)}天, 因子选择易过拟合")
-    if sources.get("sina"):
+    if market != "crypto" and sources.get("sina"):
         warnings.append(f"{sources['sina']}只日K使用新浪不复权回退, 除权日附近因子可能失真")
+    if sources.get("okx"):
+        warnings.append(f"{sources['okx']}只加密日K使用OKX回退")
+    if sources.get("nasdaq"):
+        warnings.append(f"{sources['nasdaq']}只美股日K使用Nasdaq回退")
+    pf = wf.get("portfolio") or {}
+    if pf.get("excess") is not None and pf["excess"] <= 0:
+        warnings.append("样本外Top20未跑赢等权基准, 买入标注已降级")
+    if market == "crypto":
+        warnings.append("加密日K为UTC日线, 当日未收盘bar不参与; 7x24交易无涨跌停")
+    else:
+        try:
+            _today, _mins = _bj_now()
+            if _mins < 15 * 60 + 10:
+                warnings.append("盘中运行: 因子基于最近完整交易日, 收盘后信号更完整")
+        except Exception:
+            pass
 
     meta = {
+        "market": market,
+        "universe_label": {"a": "个股", "etf": "ETF", "crypto": "加密货币",
+                           "us": "美股", "all": "个股+ETF"}.get(market, market),
         "n_universe": len(universe),
         "n_symbols": len(panel.symbols),
         "n_dates": len(panel.dates),
         "n_ic_dates": len(ic_dates),
         "n_candidates": len(stocks),
+        "n_strong": n_strong,
+        "n_buy": n_buy,
+        "n_caution": n_caution,
+        "evidence_ok": bool((wf.get("oos") or {}).get("mean_ic") is not None
+                            and (wf.get("oos") or {}).get("mean_ic") > 0
+                            and ((wf.get("portfolio") or {}).get("excess") is None
+                                 or (wf.get("portfolio") or {}).get("excess") > 0)),
         "asof": stocks[0]["asof"] if stocks else (panel.dates[-1] if panel.dates else ""),
         "horizon": horizon,
         "entry_lag": entry_lag,
@@ -1651,7 +2017,7 @@ def _pct(v):
 def _print_live(result):
     meta = result["meta"]
     wf = result["walk_forward"]
-    print(f"股票池 {meta['n_universe']} · 有效 {meta['n_symbols']} · "
+    print(f"{meta.get('universe_label', '池')} {meta['n_universe']} · 有效 {meta['n_symbols']} · "
           f"日期 {meta['n_dates']} · asof {meta['asof']} · "
           f"入选因子 {meta['selected']} · 用时 {meta['elapsed']:.1f}s")
     for w in meta.get("warnings") or []:
@@ -1676,12 +2042,16 @@ def _print_live(result):
     print(f"\n样本外 RankIC {_fmt_num(oos.get('mean_ic'), '+.4f')} · "
           f"等权基准 {_fmt_num(eq.get('mean_ic'), '+.4f')} "
           f"· 训练/测试日期 {wf.get('train_dates')}/{wf.get('test_dates')}")
+    print(f"\n次日研究标注: 强候选 {meta.get('n_strong', 0)} · "
+          f"候选 {meta.get('n_buy', 0) - meta.get('n_strong', 0)} · "
+          f"谨慎候选 {meta.get('n_caution', 0)} · "
+          f"样本外证据 {'正向' if meta.get('evidence_ok') else '不足'}")
     print("\n筛选结果 (前20):")
-    print(f"{'排名':>4} {'代码':<8}{'名称':<12}{'涨跌幅':>8}{'因子得分':>9}  主要贡献")
+    print(f"{'排名':>4} {'代码':<8}{'名称':<12}{'涨跌幅':>8}{'得分':>7}{'建议':<9}  主要贡献")
     for r in result["stocks"][:20]:
         pct_text = "--" if r["pct"] is None else f"{r['pct']:+.2f}%"
         print(f"{r['rank']:>4} {r['code']:<8}{r['name'][:10]:<12}"
-              f"{pct_text:>8}{r['score']:>9.1f}  {r['top']}")
+              f"{pct_text:>8}{r['score']:>7.1f} {r.get('advice', ''):<9}  {r['top']}")
     pf = wf.get("portfolio") or {}
     if pf.get("n_dates"):
         print(f"\n样本外Top{pf['top_k']}组合(计{pf.get('cost', 0) * 100:.2f}%往返成本, 剔除涨停): "
@@ -1699,7 +2069,9 @@ def main():
         pass
     p = argparse.ArgumentParser(description="零依赖多因子选股引擎")
     p.add_argument("--selftest", action="store_true", help="离线自检")
-    p.add_argument("--limit", type=int, default=300, help="股票池大小")
+    p.add_argument("--market", default="stock",
+                   choices=("stock", "etf", "crypto", "us", "all"), help="市场")
+    p.add_argument("--limit", type=int, default=300, help="池大小")
     p.add_argument("--lookback", type=int, default=250, help="因子回看交易日")
     p.add_argument("--bars", type=int, default=320, help="抓取日K根数")
     p.add_argument("--horizon", type=int, default=1, choices=(1, 5), help="前瞻收益天数")
@@ -1719,6 +2091,8 @@ def main():
         exclude_st=not args.include_st,
         exclude_limit_up=not args.include_limit,
         threshold=args.threshold,
+        market={"stock": "a", "etf": "etf", "crypto": "crypto",
+                "us": "us", "all": "all"}.get(args.market, "a"),
         workers=max(1, args.workers), use_cache=not args.no_cache,
         progress_cb=lambda stage, done, total, msg:
             print(f"[{stage}] {msg}", flush=True))

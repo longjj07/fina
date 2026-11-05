@@ -4,11 +4,14 @@
 A股 / 港股 / 美股 桌面看盘 + A股选股器 (零依赖: Python 标准库 + Tkinter)
 
 数据源:
-  - 自选股 / 指数: 腾讯财经 qt.gtimg.cn        (前缀 us / sh / sz / bj / hk)
-  - 选股器:        新浪 A股全市场列表 (涨跌幅+换手率) + 腾讯单只补齐量比
-  - 历史日K:       腾讯 web.ifzq.gtimg.cn (昨日涨幅对比 / 连涨 / 昨日量能)
-  - 24h消息面:     东财个股资讯(np-listapi, 三市场) + 新浪 7x24 全球快讯
-  - 因子选股:      factor_engine.py (腾讯日K + 新浪成交额股票池, RankIC/ICIR)
+  - 自选股 / 指数: 新浪 hq.sinajs.cn 批量(主) + 腾讯 qt.gtimg.cn 回退
+  - 美股数据:      Nasdaq summary/historical + Yahoo chart/news + SEC 财务
+  - 加密货币:      Binance 24h ticker/日K/逐笔 (主) + OKX 回退
+  - 选股器:        新浪 A股全市场列表 + 东财批量量比/换手, 腾讯单只回退
+  - 历史日K:       腾讯 fqkline -> 新浪 -> Yahoo(港美股兜底)
+  - 分笔成交:      腾讯(A股) / 东财(港美股) / Binance(加密) / Yahoo 1分钟分时
+  - 综合评估:      基本面(腾讯估值字段) + 24h消息面 + K线技术面 + 买入区间
+  - 因子选股:      factor_engine.py (个股/ETF/加密货币, RankIC/ICIR + 次日标注)
   - 问财选股:      同花顺 iwencai 自然语言筛选 (可选依赖 pywencai + Node.js + 登录cookie)
 均为免费、免密钥、大陆可直连。行情为延时行情(美股/港股约15分钟, A股盘中约3秒), 仅供监控参考,
 不构成任何投资建议。
@@ -25,6 +28,7 @@ import shutil
 import threading
 import time
 import urllib.request
+import urllib.parse
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 
@@ -47,6 +51,7 @@ DEFAULT_WATCHLIST = [
     "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "AVGO", "AMD", "NFLX",
     "JPM", "V", "MA", "COST", "HD", "UNH", "XOM", "JNJ", "WMT", "PG",
     "600519", "300750", "000858", "00700", "09988", "03690",
+    "BTC", "ETH",
 ]
 
 # 顶部指数: (显示名, 腾讯代码)
@@ -60,7 +65,38 @@ INDEXES = [
     ("标普500",  "usINX"),
 ]
 
-MARKET_LABEL = {"us": "美股", "sh": "沪A", "sz": "深A", "bj": "北A", "hk": "港股"}
+MARKET_LABEL = {"us": "美股", "sh": "沪A", "sz": "深A", "bj": "北A", "hk": "港股", "cr": "加密货币"}
+
+BINANCE_TICKER_URL = "https://api.binance.com/api/v3/ticker/24hr?symbols={symbols}"
+BINANCE_KLINES_URL = ("https://api.binance.com/api/v3/klines?"
+                      "symbol={sym}&interval=1d&limit={n}")
+BINANCE_TRADES_URL = "https://api.binance.com/api/v3/trades?symbol={sym}&limit={n}"
+OKX_TICKERS_URL = "https://www.okx.com/api/v5/market/tickers?instType=SPOT"
+OKX_CANDLES_URL = "https://www.okx.com/api/v5/market/candles?instId={inst}&bar=1D&limit={n}"
+OKX_TRADES_URL = "https://www.okx.com/api/v5/market/trades?instId={inst}&limit={n}"
+NASDAQ_SUMMARY_URL = "https://api.nasdaq.com/api/quote/{sym}/summary?assetclass=stocks"
+NASDAQ_HIST_URL = ("https://api.nasdaq.com/api/quote/{sym}/historical?assetclass=stocks"
+                   "&fromdate={fromdate}&limit={n}")
+YAHOO_SEARCH_URL = ("https://query1.finance.yahoo.com/v1/finance/search?"
+                    "q={sym}&quotesCount=1&newsCount={n}")
+SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
+SEC_CONCEPT_URL = "https://data.sec.gov/api/xbrl/companyconcept/CIK{cik}/{tax}/{tag}.json"
+SEC_UA = {"User-Agent": "fina-research/1.0 (research@example.com)"}
+
+# 常见币种: 裸代码直接识别为加密货币; 其他币种可用 cr:代码 显式指定
+CRYPTO_SYMBOLS = {
+    "BTC", "ETH", "BNB", "SOL", "XRP", "ADA", "DOGE", "AVAX", "LINK", "DOT",
+    "TRX", "TON", "SHIB", "LTC", "BCH", "UNI", "APT", "ARB", "OP", "SUI",
+    "PEPE", "WIF", "NEAR", "ATOM", "FIL", "INJ", "SEI", "TIA", "ETC", "XLM",
+    "HBAR", "ICP", "RENDER", "FET", "TAO", "ONDO", "JUP", "PYTH", "BONK",
+    "FLOKI", "AAVE", "MKR", "CRV", "ALGO", "VET", "STX", "IMX", "GRT", "SAND",
+    "MANA", "AXS", "GALA", "THETA", "RUNE", "KAS", "ENA", "WLD", "JTO", "STRK",
+    "ZK", "PENDLE", "LDO", "EIGEN", "ZEC", "XMR", "DASH", "COMP", "SNX", "1INCH",
+}
+CRYPTO_STABLE = {
+    "USDC", "FDUSD", "TUSD", "DAI", "USDP", "BUSD", "EUR", "AEUR", "USDD",
+    "PYUSD", "USD1", "XAUT", "PAXG",
+}
 
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 SINA_HDR = {"User-Agent": UA["User-Agent"], "Referer": "https://finance.sina.com.cn/"}
@@ -68,6 +104,160 @@ SINA_LIST_URL = ("https://vip.stock.finance.sina.com.cn/quotes_service/api/json_
                  "Market_Center.getHQNodeData?page={page}&num={num}&sort=changepercent&asc=0&node=hs_a&symbol=")
 EM_UT = "bd1d9ddb04089700cf9c27f6f7426281"
 EM_HDR = {"User-Agent": UA["User-Agent"], "Referer": "https://quote.eastmoney.com/"}
+EM_ULIST_URL = ("https://push2.eastmoney.com/api/qt/ulist.np/get?fltt=2&invt=2"
+                "&secids={secids}&ut=" + EM_UT +
+                "&fields=f2,f3,f4,f5,f6,f8,f10,f12,f13,f14,f15,f16,f17,f18,f124")
+EM_DETAILS_URL = ("https://push2.eastmoney.com/api/qt/stock/details/get?secid={secid}"
+                  "&ut=" + EM_UT +
+                  "&fields1=f1,f2,f3,f4&fields2=f51,f52,f53,f54,f55&pos=-{n}")
+EM_INDEX_SECIDS = {
+    "sh000001": "1.000001",
+    "sz399001": "0.399001",
+    "sz399006": "0.399006",
+    "hkHSI": "100.HSI",
+    "usDJI": "100.DJIA",
+    "usIXIC": "100.NDX",
+    "usINX": "100.SPX",
+}
+EM_US_SUFFIX = {105: "OQ", 106: "N", 107: "A"}
+SINA_HQ_URL = "https://hq.sinajs.cn/list={codes}"
+YAHOO_CHART_URL = ("https://query1.finance.yahoo.com/v8/finance/chart/"
+                   "{sym}?interval=1m&range=1d")
+YAHOO_DAILY_URL = ("https://query1.finance.yahoo.com/v8/finance/chart/"
+                   "{sym}?interval=1d&range=6mo")
+_EM_QUOTE_OFF_UNTIL = 0.0
+_EM_TICK_OFF_UNTIL = 0.0
+_EM_OFF_TTL = 60.0
+
+
+# ---------------------------------------------------------------------------
+# 行情源: 新浪批量(主) -> 腾讯(兜底); 东财用于量比/换手与港美股分笔
+# ---------------------------------------------------------------------------
+
+def sina_code(raw):
+    """A股/港股/指数用 sh600519 / hk00700 形式; 美股仍走腾讯(需要交易所后缀)。"""
+    c = classify_symbol(raw)
+    if not c or not raw:
+        return None
+    tcode, disp, mkt = c
+    if mkt == "us":
+        return None
+    return tcode
+
+
+def _parse_sina_block(code, body):
+    p = body.split(",")
+    if len(p) < 6:
+        return None
+    if code.startswith("gb_"):
+        price = to_float(p[1])
+        if price is None:
+            return None
+        pct = to_float(p[2])
+        change = to_float(p[4])
+        prev = to_float(p[26]) if len(p) > 26 else None
+        if prev is None and pct not in (None, -100.0):
+            prev = price / (1 + pct / 100.0)
+        return {
+            "name": p[0].strip(), "qt_code": p[0].strip(),
+            "price": price, "change": change, "pct": pct,
+            "open": to_float(p[5]), "high": to_float(p[6]), "low": to_float(p[7]),
+            "prev_close": prev, "volume": to_float(p[10], 0),
+            "time": (p[3] or "").strip()[11:19] or time.strftime("%H:%M:%S"),
+            "source": "sina",
+        }
+    if code.startswith("hk"):
+        price = to_float(p[6])
+        prev = to_float(p[3])
+        if price is None:
+            return None
+        return {
+            "name": p[1].strip() or p[0].strip(), "qt_code": code[2:],
+            "price": price, "change": to_float(p[7]), "pct": to_float(p[8]),
+            "open": to_float(p[2]),
+            "high": to_float(p[4]), "low": to_float(p[5]),
+            "prev_close": prev, "volume": to_float(p[12], 0),
+            "amount": to_float(p[11], 0),
+            "time": (p[18] if len(p) > 18 else "").strip() or time.strftime("%H:%M:%S"),
+            "source": "sina",
+        }
+    # A股 / 指数: 0名称 1开 2昨收 3现价 4高 5低 8成交量(股) 9成交额 30日期 31时间
+    price = to_float(p[3])
+    prev = to_float(p[2])
+    if price is None:
+        return None
+    vol = to_float(p[8], 0)
+    return {
+        "name": p[0].strip(), "qt_code": code[2:],
+        "price": price,
+        "change": round(price - prev, 3) if prev else None,
+        "pct": round((price - prev) / prev * 100, 2) if prev else None,
+        "open": to_float(p[1]),
+        "high": to_float(p[4]), "low": to_float(p[5]),
+        "prev_close": prev,
+        "volume": (vol or 0) / 100.0,
+        "amount": to_float(p[9], 0),
+        "time": (p[31] if len(p) > 31 else "").strip() or time.strftime("%H:%M:%S"),
+        "source": "sina",
+    }
+
+
+def _fetch_sina_quotes(codes):
+    out = {}
+    for i in range(0, len(codes), 40):
+        chunk = codes[i:i + 40]
+        try:
+            raw = _http(SINA_HQ_URL.format(codes=",".join(chunk)), SINA_HDR, timeout=6)
+            text = raw.decode("gbk", "replace")
+        except Exception:
+            continue
+        for line in text.split(";"):
+            line = line.strip()
+            if not line.startswith("var hq_str_"):
+                continue
+            head, _, rest = line.partition("=")
+            code = head[len("var hq_str_"):].strip()
+            if '"' not in rest:
+                continue
+            body = rest.split('"')[1]
+            if not body:
+                continue
+            q = _parse_sina_block(code, body)
+            if q:
+                out[code] = q
+    return out
+
+
+def fetch_quotes_auto(items):
+    """items = [(key, sina_code, tcode)]; 新浪整批 -> 腾讯补齐缺失。"""
+    sina_codes = {}
+    for key, scode, _tcode in items:
+        if scode:
+            sina_codes[scode] = key
+    sina_rows = _fetch_sina_quotes(list(sina_codes)) if sina_codes else {}
+    out = {}
+    for scode, q in sina_rows.items():
+        key = sina_codes.get(scode)
+        if key:
+            out[key] = q
+    missing = [(k, t) for k, _s, t in items if k not in out]
+    fallback = {"tencent": 0, "yahoo": 0}
+
+    def fill(it):
+        key, tcode = it
+        q = fetch_tencent_quote(tcode)
+        if not q and tcode.startswith("us"):
+            q = fetch_yahoo_quote(tcode[2:])
+        return key, q, (q or {}).get("source", "")
+
+    if missing:
+        with ThreadPoolExecutor(max_workers=min(8, len(missing))) as ex:
+            for key, q, src in ex.map(fill, missing):
+                if q:
+                    out[key] = q
+                    if src in fallback:
+                        fallback[src] += 1
+    return out, {"sina": len(out) - sum(fallback.values()), **fallback}
 
 # 涨跌配色(默认红涨绿跌, 界面可切换)
 COLOR_UP_DEFAULT = "#d64545"
@@ -100,8 +290,64 @@ def to_float(x, nd=2):
         return None
 
 
+def _raw_float(x, default=None):
+    """不四舍五入的数值转换, 用于加密货币价格/数量。"""
+    try:
+        v = float(x)
+        return v if math.isfinite(v) else default
+    except (TypeError, ValueError):
+        return default
+
+
 def fmt_price(v):
     return "--" if v is None else f"{v:,.2f}"
+
+
+def fmt_crypto_price(v):
+    if v is None:
+        return "--"
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return "--"
+    a = abs(v)
+    if a >= 1000:
+        return f"{v:,.2f}"
+    if a >= 1:
+        return f"{v:,.3f}"
+    if a >= 0.01:
+        return f"{v:.4f}"
+    if a >= 0.0001:
+        return f"{v:.6f}"
+    return f"{v:.8f}"
+
+
+def fmt_crypto_qty(v):
+    if v is None:
+        return "--"
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return "--"
+    a = abs(v)
+    if a >= 1e6:
+        return f"{v / 1e6:.2f}M"
+    if a >= 1e3:
+        return f"{v / 1e3:.2f}K"
+    if a >= 1:
+        return f"{v:,.3f}"
+    return f"{v:.6f}"
+
+
+def fmt_crypto_signed(v):
+    if v is None:
+        return "--"
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return "--"
+    sign = "+" if v > 0 else ("-" if v < 0 else "")
+    return sign + fmt_crypto_price(abs(v))
 
 
 def fmt_signed(v):
@@ -192,14 +438,23 @@ def classify_symbol(raw):
         return "hk" + s[2:], s[2:], "hk"
     if p2 == "US" and s[2:]:
         return "us" + s[2:], s[2:], "us"
+    # 加密货币: CR:BTC / CR:BTCUSDT / 常见裸代码(BTC/ETH/SOL...)
+    if s.startswith("CR:"):
+        base = s[3:].replace("/", "").strip()
+        if base.endswith("USDT"):
+            base = base[:-4]
+        if base:
+            return "cr" + base + "USDT", base, "cr"
+    if s in CRYPTO_SYMBOLS:
+        return "cr" + s + "USDT", s, "cr"
     # 纯数字
     if s.isdigit():
         if len(s) == 5:
             return "hk" + s, s, "hk"          # 港股 5 位
         if len(s) == 6:
             c = s[0]
-            if c in "69":
-                return "sh" + s, s, "sh"      # 沪市
+            if c in "569":
+                return "sh" + s, s, "sh"      # 沪市股票/ETF/B股
             if c in "023":
                 return "sz" + s, s, "sz"      # 深市
             if c in "48":
@@ -207,6 +462,838 @@ def classify_symbol(raw):
             return "sz" + s, s, "sz"
     # 字母(可含 . 或 -) -> 美股
     return "us" + s, s, "us"
+
+
+# ---------------------------------------------------------------------------
+# 行情源: 东方财富批量快照(主) + 腾讯(回退) + 分笔成交
+# ---------------------------------------------------------------------------
+
+def em_quote_candidates(raw):
+    """代码 -> 东财 secid 候选。美股未知交易所, 同时尝试 NASDAQ/NYSE/AMEX。"""
+    s = (raw or "").strip()
+    if not s:
+        return []
+    if s in EM_INDEX_SECIDS:
+        return [EM_INDEX_SECIDS[s]]
+    c = classify_symbol(s)
+    if not c:
+        return []
+    _tcode, disp, mkt = c
+    if mkt == "sh":
+        return ["1." + disp]
+    if mkt in ("sz", "bj"):
+        return ["0." + disp]
+    if mkt == "hk":
+        return ["116." + disp]
+    if mkt == "us":
+        out = [f"105.{disp}", f"106.{disp}", f"107.{disp}"]
+        if "." in disp:
+            alt = disp.replace(".", "-")
+            out += [f"105.{alt}", f"106.{alt}", f"107.{alt}"]
+        return out
+    return []
+
+
+def _fetch_em_quote_rows(secids):
+    global _EM_QUOTE_OFF_UNTIL
+    if time.time() < _EM_QUOTE_OFF_UNTIL:
+        return {}
+    rows = {}
+    uniq = []
+    seen = set()
+    for s in secids:
+        if s and s not in seen:
+            seen.add(s)
+            uniq.append(s)
+    for i in range(0, len(uniq), 80):
+        batch = uniq[i:i + 80]
+        try:
+            raw = _http(EM_ULIST_URL.format(secids=",".join(batch)), EM_HDR, timeout=6)
+            data = json.loads(raw.decode("utf-8", "replace"))
+        except Exception:
+            _EM_QUOTE_OFF_UNTIL = time.time() + _EM_OFF_TTL
+            break
+        for row in (data.get("data") or {}).get("diff") or []:
+            code = str(row.get("f12") or "")
+            mkt = row.get("f13")
+            if code:
+                rows[f"{mkt}.{code}"] = row
+    if rows:
+        _EM_QUOTE_OFF_UNTIL = 0.0
+    return rows
+
+
+def _em_quote_from_row(row):
+    price = to_float(row.get("f2"))
+    if price is None:
+        return None
+    code = str(row.get("f12") or "")
+    mkt = row.get("f13")
+    suffix = EM_US_SUFFIX.get(mkt)
+    qt_code = f"{code}.{suffix}" if suffix else code
+    try:
+        ts = time.strftime("%H:%M:%S", time.localtime(float(row.get("f124"))))
+    except (TypeError, ValueError, OSError, OverflowError):
+        ts = time.strftime("%H:%M:%S")
+    return {
+        "name": str(row.get("f14") or ""),
+        "qt_code": qt_code,
+        "price": price,
+        "change": to_float(row.get("f4")),
+        "pct": to_float(row.get("f3")),
+        "open": to_float(row.get("f17")),
+        "high": to_float(row.get("f15")),
+        "low": to_float(row.get("f16")),
+        "prev_close": to_float(row.get("f18")),
+        "volume": to_float(row.get("f5"), 0),
+        "amount": to_float(row.get("f6"), 0),
+        "turnover": to_float(row.get("f8")),
+        "volume_ratio": to_float(row.get("f10")),
+        "time": ts,
+        "source": "eastmoney",
+    }
+
+
+def fetch_em_quotes(items):
+    """items = [(key, [secid...]), ...] -> {key: quote}"""
+    secids = []
+    for _key, cands in items:
+        secids.extend(cands)
+    rows = _fetch_em_quote_rows(secids)
+    out = {}
+    for key, cands in items:
+        for secid in cands:
+            row = rows.get(secid)
+            if row:
+                q = _em_quote_from_row(row)
+                if q:
+                    out[key] = q
+                    break
+    return out
+
+
+def fetch_tencent_batch(tcodes):
+    """腾讯批量报价: tcodes 形如 ['usAAPL','usMSFT']。"""
+    out = {}
+    uniq = list(dict.fromkeys(t for t in tcodes if t))
+    for i in range(0, len(uniq), 50):
+        chunk = uniq[i:i + 50]
+        try:
+            raw = _http("https://qt.gtimg.cn/q=" + ",".join(chunk), UA,
+                        timeout=8).decode("gbk", "replace")
+        except Exception:
+            continue
+        for line in raw.split(";"):
+            line = line.strip()
+            if not line.startswith("v_") or '"' not in line:
+                continue
+            try:
+                q = parse_tencent(line)
+            except Exception:
+                continue
+            code = line[2:line.find("=")].strip()
+            out[code] = q
+    return out
+
+
+def fetch_tencent_quote(tcode):
+    try:
+        raw = _http("https://qt.gtimg.cn/q=" + tcode, UA).decode("gbk", "replace")
+        q = parse_tencent(raw)
+        q["source"] = "tencent"
+        return q
+    except Exception:
+        return None
+
+
+def _crypto_pair(raw):
+    c = classify_symbol(raw)
+    if not c or c[2] != "cr":
+        return None
+    return c[0][2:]          # crBTCUSDT -> BTCUSDT
+
+
+def _utc_date(ms):
+    return time.strftime("%Y-%m-%d", time.gmtime(float(ms) / 1000.0))
+
+
+def _crypto_quote_from_binance(row, raw):
+    price = _raw_float(row.get("lastPrice"))
+    if price is None:
+        return None
+    pair = str(row.get("symbol") or "")
+    return {
+        "name": pair[:-4] if pair.endswith("USDT") else pair,
+        "qt_code": pair,
+        "price": price,
+        "change": _raw_float(row.get("priceChange")),
+        "pct": _raw_float(row.get("priceChangePercent")),
+        "open": _raw_float(row.get("openPrice")),
+        "high": _raw_float(row.get("highPrice")),
+        "low": _raw_float(row.get("lowPrice")),
+        "prev_close": _raw_float(row.get("openPrice")),
+        "volume": _raw_float(row.get("volume"), 0),
+        "amount": _raw_float(row.get("quoteVolume"), 0),
+        "time": time.strftime("%H:%M:%S", time.localtime(float(row.get("closeTime") or 0) / 1000.0)),
+        "source": "binance",
+    }
+
+
+def fetch_crypto_quotes(raw_symbols):
+    """Binance 24h ticker 批量; 缺失项用 OKX 补齐。"""
+    pairs = {}
+    for raw in raw_symbols:
+        pair = _crypto_pair(raw)
+        if pair:
+            pairs[pair] = raw
+    out = {}
+    if not pairs:
+        return out, "binance"
+    try:
+        sym_json = urllib.parse.quote(json.dumps(list(pairs), separators=(",", ":")))
+        raw = _http(BINANCE_TICKER_URL.format(symbols=sym_json), UA, timeout=8)
+        arr = json.loads(raw.decode("utf-8", "replace"))
+        for row in arr if isinstance(arr, list) else []:
+            pair = str(row.get("symbol") or "")
+            source_raw = pairs.get(pair)
+            if not source_raw:
+                continue
+            q = _crypto_quote_from_binance(row, source_raw)
+            if q:
+                out[source_raw] = q
+    except Exception:
+        pass
+    missing = [p for p, raw in pairs.items() if raw not in out]
+    if missing:
+        try:
+            raw = _http(OKX_TICKERS_URL, UA, timeout=8)
+            data = json.loads(raw.decode("utf-8", "replace"))
+            okx = {}
+            for row in (data.get("data") or []):
+                inst = str(row.get("instId") or "")
+                if inst.endswith("-USDT"):
+                    okx[inst.replace("-", "")] = row
+            for pair in missing:
+                row = okx.get(pair)
+                if not row:
+                    continue
+                last = _raw_float(row.get("last"))
+                open24 = _raw_float(row.get("open24h"))
+                if last is None:
+                    continue
+                change = (last - open24) if open24 not in (None, 0) else None
+                pct = (change / open24 * 100.0) if open24 else None
+                base = pair[:-4] if pair.endswith("USDT") else pair
+                out[pairs[pair]] = {
+                    "name": base, "qt_code": pair,
+                    "price": last, "change": change, "pct": pct,
+                    "open": open24,
+                    "high": _raw_float(row.get("high24h")),
+                    "low": _raw_float(row.get("low24h")),
+                    "prev_close": open24,
+                    "volume": _raw_float(row.get("vol24h"), 0),
+                    "amount": _raw_float(row.get("volCcy24h"), 0),
+                    "time": time.strftime("%H:%M:%S", time.localtime(float(row.get("ts") or 0) / 1000.0)),
+                    "source": "okx",
+                }
+        except Exception:
+            pass
+    return out, "binance"
+
+
+def fetch_crypto_bars(pair, n=320):
+    """Binance 日K(UTC); 失败回退 OKX。去掉当日未收盘 bar。"""
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    try:
+        raw = _http(BINANCE_KLINES_URL.format(sym=pair, n=n), UA, timeout=8)
+        arr = json.loads(raw.decode("utf-8", "replace"))
+        bars = []
+        for k in arr if isinstance(arr, list) else []:
+            if not isinstance(k, (list, tuple)) or len(k) < 6:
+                continue
+            bars.append({
+                "date": _utc_date(k[0]),
+                "open": _raw_float(k[1]), "high": _raw_float(k[2]),
+                "low": _raw_float(k[3]), "close": _raw_float(k[4]),
+                "volume": _raw_float(k[5], 0),
+            })
+        bars = [b for b in bars if b["close"] is not None and b["date"] <= today]
+        if bars and bars[-1]["date"] == today:
+            bars = bars[:-1]          # 当日 UTC 日K未收盘
+        if bars:
+            return bars
+    except Exception:
+        pass
+    try:
+        inst = pair[:-4] + "-USDT" if pair.endswith("USDT") else pair
+        raw = _http(OKX_CANDLES_URL.format(inst=inst, n=n), UA, timeout=8)
+        data = json.loads(raw.decode("utf-8", "replace"))
+        bars = []
+        for k in (data.get("data") or []):
+            if len(k) < 6:
+                continue
+            bars.append({
+                "date": _utc_date(k[0]),
+                "open": _raw_float(k[1]), "high": _raw_float(k[2]),
+                "low": _raw_float(k[3]), "close": _raw_float(k[4]),
+                "volume": _raw_float(k[5], 0),
+            })
+        bars.sort(key=lambda b: b["date"])
+        bars = [b for b in bars if b["close"] is not None and b["date"] <= today]
+        if bars and bars[-1]["date"] == today:
+            bars = bars[:-1]
+        return bars
+    except Exception:
+        return []
+
+
+def fetch_crypto_trades(pair, n=50):
+    try:
+        raw = _http(BINANCE_TRADES_URL.format(sym=pair, n=max(20, min(100, n))),
+                    UA, timeout=8)
+        arr = json.loads(raw.decode("utf-8", "replace"))
+        rows = []
+        for i, t in enumerate(arr if isinstance(arr, list) else []):
+            price = _raw_float(t.get("price"))
+            if price is None:
+                continue
+            maker = bool(t.get("isBuyerMaker"))
+            rows.append({
+                "index": i,
+                "time": time.strftime("%H:%M:%S",
+                                      time.localtime(float(t.get("time") or 0) / 1000.0)),
+                "price": price,
+                "volume": _raw_float(t.get("qty"), 0),
+                "amount": _raw_float(t.get("quoteQty"), 0),
+                "direction": "卖" if maker else "买",
+            })
+        return rows
+    except Exception:
+        pass
+    try:
+        inst = pair[:-4] + "-USDT" if pair.endswith("USDT") else pair
+        raw = _http(OKX_TRADES_URL.format(inst=inst, n=max(20, min(100, n))),
+                    UA, timeout=8)
+        data = json.loads(raw.decode("utf-8", "replace"))
+        rows = []
+        for i, t in enumerate(data.get("data") or []):
+            price = _raw_float(t.get("px"))
+            if price is None:
+                continue
+            rows.append({
+                "index": i,
+                "time": time.strftime("%H:%M:%S",
+                                      time.localtime(float(t.get("ts") or 0) / 1000.0)),
+                "price": price,
+                "volume": _raw_float(t.get("sz"), 0),
+                "amount": None,
+                "direction": "买" if str(t.get("side")) == "buy" else "卖",
+            })
+        return rows
+    except Exception:
+        return []
+
+
+def _us_ticker(raw):
+    c = classify_symbol(raw)
+    if not c or c[2] != "us":
+        return None
+    disp = c[1]
+    for suf in (".OQ", ".N", ".A"):
+        if disp.endswith(suf):
+            disp = disp[:-3]
+            break
+    return disp
+
+
+def _money(v):
+    s = str(v or "").replace("$", "").replace(",", "").replace("%", "").strip()
+    if s in ("", "N/A", "--", "-", "None"):
+        return None
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        return None
+
+
+def _split_52(v):
+    parts = str(v or "").replace("$", "").replace(",", "").split("/")
+    if len(parts) < 2:
+        return None, None
+    try:
+        return float(parts[1]), float(parts[0])   # low, high
+    except (TypeError, ValueError):
+        return None, None
+
+
+_US_QT_CACHE = {}
+
+
+def _us_tencent_code(symbol):
+    if not symbol.startswith("us"):
+        return symbol
+    disp = symbol[2:]
+    if any(disp.endswith(x) for x in (".OQ", ".N", ".A")):
+        return symbol
+    hit = _US_QT_CACHE.get(disp)
+    if hit:
+        return "us" + hit
+    q = fetch_tencent_quote("us" + disp)
+    code = (q or {}).get("qt_code") or ""
+    if "." in code:
+        _US_QT_CACHE[disp] = code
+        return "us" + code
+    return symbol
+
+
+_NASDAQ_SUMMARY_CACHE = {}
+_NASDAQ_HIST_CACHE = {}
+_YAHOO_NEWS_CACHE = {}
+
+
+def fetch_nasdaq_summary(sym):
+    sym = (sym or "").upper()
+    if not sym:
+        return {}
+    hit = _NASDAQ_SUMMARY_CACHE.get(sym)
+    if hit and time.time() - hit[0] < 300:
+        return hit[1]
+    try:
+        hdr = {"User-Agent": UA["User-Agent"], "Referer": "https://www.nasdaq.com/",
+               "Accept": "application/json, text/plain, */*"}
+        raw = _http(NASDAQ_SUMMARY_URL.format(sym=sym), hdr, timeout=10)
+        sd = (json.loads(raw.decode("utf-8", "replace")).get("data") or {}).get("summaryData") or {}
+        low52, high52 = _split_52((sd.get("FiftTwoWeekHighLow") or {}).get("value"))
+        out = {
+            "sector": (sd.get("Sector") or {}).get("value"),
+            "industry": (sd.get("Industry") or {}).get("value"),
+            "mktcap": _money((sd.get("MarketCap") or {}).get("value")),
+            "high52": high52, "low52": low52,
+            "avg_volume": _money((sd.get("AverageVolume") or {}).get("value")),
+            "one_year_target": _money((sd.get("OneYrTarget") or {}).get("value")),
+            "prev_close": _money((sd.get("PreviousClose") or {}).get("value")),
+            "dividend": _money((sd.get("AnnualizedDividend") or {}).get("value")),
+            "yield": _money((sd.get("Yield") or {}).get("value")),
+            "source": "nasdaq",
+        }
+        _NASDAQ_SUMMARY_CACHE[sym] = (time.time(), out)
+        return out
+    except Exception:
+        return {}
+
+
+def fetch_nasdaq_daily(sym, n=120):
+    sym = (sym or "").upper()
+    if not sym:
+        return []
+    hit = _NASDAQ_HIST_CACHE.get(sym)
+    if hit and time.time() - hit[0] < 300:
+        return hit[1][-n:]
+    try:
+        fromdate = time.strftime("%Y-%m-%d",
+                                 time.localtime(time.time() - max(60, n * 2) * 86400))
+        hdr = {"User-Agent": UA["User-Agent"], "Referer": "https://www.nasdaq.com/",
+               "Accept": "application/json, text/plain, */*"}
+        raw = _http(NASDAQ_HIST_URL.format(sym=sym, fromdate=fromdate, n=n), hdr, timeout=12)
+        rows = (((json.loads(raw.decode("utf-8", "replace")).get("data") or {})
+                 .get("tradesTable") or {}).get("rows") or [])
+        bars = []
+        for r in rows:
+            try:
+                dt = time.strptime(str(r.get("date") or ""), "%m/%d/%Y")
+                date = time.strftime("%Y-%m-%d", dt)
+            except Exception:
+                continue
+            c = _money(r.get("close"))
+            if c is None:
+                continue
+            bars.append({"date": date, "open": _money(r.get("open")),
+                         "close": c, "high": _money(r.get("high")),
+                         "low": _money(r.get("low")),
+                         "volume": _money(r.get("volume")) or 0})
+        bars.sort(key=lambda b: b["date"])
+        _NASDAQ_HIST_CACHE[sym] = (time.time(), bars)
+        return bars[-n:]
+    except Exception:
+        return []
+
+
+def fetch_yahoo_news(sym, n=6):
+    sym = (sym or "").upper()
+    if not sym:
+        return []
+    hit = _YAHOO_NEWS_CACHE.get(sym)
+    if hit and time.time() - hit[0] < 300:
+        return hit[1][:n]
+    try:
+        raw = _http(YAHOO_SEARCH_URL.format(sym=sym, n=max(3, n)), UA, timeout=10)
+        data = json.loads(raw.decode("utf-8", "replace"))
+        out = []
+        for it in data.get("news") or []:
+            ts = it.get("providerPublishTime")
+            t = time.strftime("%m-%d %H:%M", time.localtime(float(ts))) if ts else ""
+            title = str(it.get("title") or "")
+            out.append({"time": t, "title": title,
+                        "url": it.get("link") or "",
+                        "publisher": str(it.get("publisher") or ""),
+                        "impact": classify_announcement(title)})
+        _YAHOO_NEWS_CACHE[sym] = (time.time(), out)
+        return out[:n]
+    except Exception:
+        return []
+
+
+def fetch_yahoo_quote(sym):
+    sym = (sym or "").upper().replace(".OQ", "").replace(".N", "").replace(".A", "")
+    try:
+        raw = _http(YAHOO_CHART_URL.format(sym=sym), UA, timeout=10)
+        res = ((json.loads(raw.decode("utf-8", "replace")).get("chart") or {})
+               .get("result") or [])
+        if not res:
+            return None
+        meta = res[0].get("meta") or {}
+        price = _raw_float(meta.get("regularMarketPrice"))
+        prev = _raw_float(meta.get("previousClose") or meta.get("chartPreviousClose"))
+        if price is None:
+            return None
+        ts = meta.get("regularMarketTime")
+        return {
+            "name": meta.get("longName") or meta.get("shortName") or sym,
+            "qt_code": sym, "price": price,
+            "change": (price - prev) if prev else None,
+            "pct": ((price / prev - 1) * 100) if prev else None,
+            "open": None,
+            "high": _raw_float(meta.get("regularMarketDayHigh")),
+            "low": _raw_float(meta.get("regularMarketDayLow")),
+            "prev_close": prev,
+            "volume": _raw_float(meta.get("regularMarketVolume"), 0),
+            "time": time.strftime("%H:%M:%S", time.localtime(float(ts))) if ts else "",
+            "source": "yahoo",
+        }
+    except Exception:
+        return None
+
+
+_SEC_CIK = None
+_SEC_CIK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sec_tickers.json")
+_SEC_FUND_CACHE = {}
+
+
+def _sec_cik_map():
+    global _SEC_CIK
+    if _SEC_CIK is not None:
+        return _SEC_CIK
+    data = None
+    try:
+        with open(_SEC_CIK_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        try:
+            raw = _http(SEC_TICKERS_URL, SEC_UA, timeout=20)
+            data = json.loads(raw.decode("utf-8", "replace"))
+            with open(_SEC_CIK_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
+        except Exception:
+            data = {}
+    out = {}
+    for v in (data or {}).values():
+        try:
+            out[str(v.get("ticker") or "").upper()] = str(v.get("cik_str") or "").zfill(10)
+        except Exception:
+            pass
+    _SEC_CIK = out
+    return out
+
+
+def _sec_annual(vals, unit):
+    arr = [x for x in (vals.get(unit) or [])
+           if x.get("form") in ("10-K", "10-K/A") and x.get("fp") == "FY"
+           and x.get("val") is not None]
+    arr.sort(key=lambda x: (x.get("end") or "", x.get("filed") or ""))
+    uniq = {}
+    for x in arr:
+        uniq[x.get("end")] = x
+    seq = [uniq[k] for k in sorted(uniq)]
+    if not seq:
+        return None, None
+    return seq[-1], (seq[-2] if len(seq) >= 2 else None)
+
+
+def _sec_concept(cik, tax, tag):
+    try:
+        raw = _http(SEC_CONCEPT_URL.format(cik=cik, tax=tax, tag=tag),
+                    SEC_UA, timeout=15)
+        return json.loads(raw.decode("utf-8", "replace")).get("units") or {}
+    except Exception:
+        return {}
+
+
+def fetch_sec_fundamentals(sym):
+    sym = (sym or "").upper()
+    hit = _SEC_FUND_CACHE.get(sym)
+    if hit and time.time() - hit[0] < 3600:
+        return hit[1]
+    cik = _sec_cik_map().get(sym)
+    if not cik:
+        return {}
+    tags = [
+        ("revenue", "us-gaap", "RevenueFromContractWithCustomerExcludingAssessedTax", "USD"),
+        ("revenue_fb", "us-gaap", "Revenues", "USD"),
+        ("net_income", "us-gaap", "NetIncomeLoss", "USD"),
+        ("equity", "us-gaap", "StockholdersEquity", "USD"),
+        ("eps", "us-gaap", "EarningsPerShareDiluted", "USD/shares"),
+        ("shares", "dei", "EntityCommonStockSharesOutstanding", "shares"),
+    ]
+    got = {}
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        futs = {k: ex.submit(_sec_concept, cik, tax, tag) for k, tax, tag, _u in tags}
+        for k, _tax, _tag, _unit in tags:
+            try:
+                got[k] = futs[k].result()
+            except Exception:
+                got[k] = {}
+    rev_last, rev_prev = _sec_annual(got["revenue"], "USD")
+    if not rev_last:
+        rev_last, rev_prev = _sec_annual(got["revenue_fb"], "USD")
+    ni_last, _ni_prev = _sec_annual(got["net_income"], "USD")
+    eq_last, _eq_prev = _sec_annual(got["equity"], "USD")
+    eps_last, _eps_prev = _sec_annual(got["eps"], "USD/shares")
+    sh_last, _sh_prev = _sec_annual(got["shares"], "shares")
+    out = {}
+    if rev_last:
+        out["revenue"] = rev_last.get("val")
+        out["revenue_asof"] = rev_last.get("end")
+        if rev_prev and rev_prev.get("val"):
+            out["revenue_growth"] = rev_last["val"] / rev_prev["val"] - 1
+    if ni_last:
+        out["net_income"] = ni_last.get("val")
+    if eq_last:
+        out["equity"] = eq_last.get("val")
+    if eps_last:
+        out["eps"] = eps_last.get("val")
+    if sh_last:
+        out["shares"] = sh_last.get("val")
+    if out.get("net_income") and out.get("revenue"):
+        out["net_margin"] = out["net_income"] / out["revenue"]
+    if out.get("net_income") and out.get("equity"):
+        out["roe"] = out["net_income"] / out["equity"]
+    _SEC_FUND_CACHE[sym] = (time.time(), out)
+    return out
+
+
+def _fetch_em_ticks(secid, n=50):
+    global _EM_TICK_OFF_UNTIL
+    if time.time() < _EM_TICK_OFF_UNTIL:
+        return []
+    # 东财 pos 是分页位置: -50 附近为最近成交; 过大反而会落到早盘
+    n = max(20, min(50, int(n)))
+    try:
+        raw = _http(EM_DETAILS_URL.format(secid=secid, n=n), EM_HDR, timeout=6)
+        data = json.loads(raw.decode("utf-8", "replace"))
+    except Exception:
+        _EM_TICK_OFF_UNTIL = time.time() + _EM_OFF_TTL
+        raise
+    rows = []
+    for line in (data.get("data") or {}).get("details") or []:
+        p = str(line).split(",")
+        if len(p) < 4:
+            continue
+        price = to_float(p[1])
+        if price is None:
+            continue
+        bs = p[4].strip() if len(p) > 4 else ""
+        rows.append({
+            "time": p[0],
+            "price": price,
+            "volume": to_float(p[2]),
+            "amount": to_float(p[3]),
+            "direction": "买" if bs == "1" else ("卖" if bs == "2" else "中性"),
+        })
+    return rows
+
+
+def _fetch_tencent_ticks_page(tcode, page):
+    try:
+        url = ("https://stock.gtimg.cn/data/index.php?appn=detail&action=data"
+               f"&c={tcode}&p={page}")
+        hdr = {"User-Agent": UA["User-Agent"], "Referer": "https://gu.qq.com/"}
+        text = _http(url, hdr, timeout=6).decode("utf-8", "replace")
+        a, b = text.find('"'), text.rfind('"')
+        if a < 0 or b <= a:
+            return []
+        rows = []
+        for item in text[a + 1:b].split("|"):
+            p = item.split("/")
+            if len(p) < 7:
+                continue
+            price = to_float(p[2])
+            if price is None:
+                continue
+            rows.append({
+                "index": int(p[0]) if p[0].isdigit() else 0,
+                "time": p[1],
+                "price": price,
+                "volume": to_float(p[4]),
+                "amount": to_float(p[5]),
+                "direction": {"B": "买", "S": "卖"}.get(p[6].strip(), "中性"),
+            })
+        return rows
+    except Exception:
+        return []
+
+
+_TICK_LAST_PAGE = {}
+
+
+def _fetch_tencent_ticks(tcode):
+    """腾讯分笔按页返回; 自动定位最后一页, 缓存页号避免重复扫描。"""
+    known = _TICK_LAST_PAGE.get(tcode)
+    if known is None:
+        first = _fetch_tencent_ticks_page(tcode, 0)
+        if not first:
+            return []
+        lo, hi = 0, 1
+        while hi <= 256:
+            rows = _fetch_tencent_ticks_page(tcode, hi)
+            if not rows:
+                break
+            lo, hi = hi, hi * 2
+        while lo + 1 < hi:
+            mid = (lo + hi) // 2
+            if _fetch_tencent_ticks_page(tcode, mid):
+                lo = mid
+            else:
+                hi = mid
+        known = lo
+    else:
+        while known < 512 and _fetch_tencent_ticks_page(tcode, known + 1):
+            known += 1
+    _TICK_LAST_PAGE[tcode] = known
+    rows = []
+    for pg in (known - 1, known):
+        if pg >= 0:
+            rows.extend(_fetch_tencent_ticks_page(tcode, pg))
+    dedup = {r["index"]: r for r in rows}
+    ordered = [dedup[k] for k in sorted(dedup)]
+    return ordered[-140:]
+
+
+def fetch_ticks(code, n=50):
+    c = classify_symbol(code)
+    if c and c[2] == "cr":
+        rows = fetch_crypto_trades(c[0][2:], n)
+        if rows:
+            return rows, "Binance"
+    # A股逐笔优先用腾讯(稳定、字段清晰); 港股/美股用东财
+    if c and c[2] in ("sh", "sz", "bj"):
+        rows = _fetch_tencent_ticks(c[0])
+        if rows:
+            return rows, "腾讯"
+    for secid in em_quote_candidates(code):
+        try:
+            rows = _fetch_em_ticks(secid, n)
+            if rows:
+                return rows, "东财"
+        except Exception:
+            continue
+    if c:
+        rows = _fetch_yahoo_minutes(code, max(20, n))
+        if rows:
+            return rows, "Yahoo分时"
+    return [], ""
+
+
+def _yahoo_symbol(code):
+    c = classify_symbol(code)
+    if not c:
+        return None
+    _tcode, disp, mkt = c
+    if mkt == "us":
+        # 腾讯后缀 .OQ/.N/.A 需先剥离; Yahoo 用 BRK-B 形式
+        if "." in disp and disp.rsplit(".", 1)[-1] in ("OQ", "N", "A"):
+            disp = disp.rsplit(".", 1)[0]
+        return disp.replace(".", "-")
+    if mkt == "hk":
+        return disp.lstrip("0").zfill(4) + ".HK"
+    if mkt == "sh":
+        return disp + ".SS"
+    if mkt == "sz":
+        return disp + ".SZ"
+    return None
+
+
+def _fetch_yahoo_daily(symbol, n=12):
+    """腾讯/新浪日K均失败时的美股/港股日K兜底。"""
+    sym = _yahoo_symbol(symbol)
+    if not sym:
+        return []
+    try:
+        raw = _http(YAHOO_DAILY_URL.format(sym=sym), UA, timeout=8)
+        data = json.loads(raw.decode("utf-8", "replace"))
+        res = (data.get("chart") or {}).get("result") or []
+        if not res:
+            return []
+        meta = res[0].get("meta") or {}
+        ts = res[0].get("timestamp") or []
+        quote = (res[0].get("indicators", {}).get("quote") or [{}])[0]
+        closes = quote.get("close") or []
+        opens = quote.get("open") or []
+        highs = quote.get("high") or []
+        lows = quote.get("low") or []
+        vols = quote.get("volume") or []
+        offset = int(meta.get("gmtoffset") or 0)
+        bars = []
+        for i, t in enumerate(ts):
+            c = closes[i] if i < len(closes) else None
+            if c is None:
+                continue
+            bars.append({
+                "date": time.strftime("%Y-%m-%d", time.gmtime(float(t) + offset)),
+                "open": opens[i] if i < len(opens) else None,
+                "close": c,
+                "high": highs[i] if i < len(highs) else None,
+                "low": lows[i] if i < len(lows) else None,
+                "volume": vols[i] if i < len(vols) else 0,
+            })
+        return bars[-n:]
+    except Exception:
+        return []
+
+
+def _fetch_yahoo_minutes(code, n=60):
+    """港股/美股逐笔不可得时的 1 分钟分时兜底。"""
+    sym = _yahoo_symbol(code)
+    if not sym:
+        return []
+    try:
+        raw = _http(YAHOO_CHART_URL.format(sym=sym), UA, timeout=8)
+        data = json.loads(raw.decode("utf-8", "replace"))
+        res = (data.get("chart") or {}).get("result") or []
+        if not res:
+            return []
+        meta = res[0].get("meta") or {}
+        ts = res[0].get("timestamp") or []
+        quote = (res[0].get("indicators", {}).get("quote") or [{}])[0]
+        closes = quote.get("close") or []
+        vols = quote.get("volume") or []
+        offset = int(meta.get("gmtoffset") or 0)
+        rows = []
+        prev = None
+        for t, price, vol in zip(ts, closes, vols):
+            if price is None:
+                continue
+            direction = ("买" if prev is not None and price > prev
+                         else ("卖" if prev is not None and price < prev else "中性"))
+            rows.append({
+                "time": time.strftime("%H:%M", time.gmtime(float(t) + offset)),
+                "price": float(price),
+                "volume": vol,
+                "direction": direction,
+            })
+            prev = price
+        return rows[-n:]
+    except Exception:
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +1338,66 @@ def sina_fetch_candidates(min_gain):
     return out
 
 
+def fetch_screen_universe(market="a", f_min=0.0, limit=800):
+    """选股器统一股票池: a=A股, us=美股, etf=A股ETF。"""
+    out = []
+    if market == "us":
+        if factor_engine is None:
+            raise RuntimeError("factor_engine.py 不可用")
+        rows = factor_engine.fetch_us_universe(limit)
+        quotes = fetch_tencent_batch(["us" + str(r.get("code") or "") for r in rows])
+        for r in rows:
+            sym = r.get("symbol")
+            q = quotes.get(sym) or {}
+            price = q.get("price") if q.get("price") is not None else r.get("price")
+            volume = q.get("volume") if q.get("volume") is not None else r.get("volume")
+            out.append({
+                "symbol": sym, "code": r.get("code"),
+                "name": r.get("name") or q.get("name") or r.get("code"),
+                "price": price,
+                "pct": q.get("pct") if q.get("pct") is not None else r.get("pct"),
+                "amount": (volume or 0) * (price or 0) or r.get("amount"),
+                "volume": volume,
+                "turnover": None,
+                "high": q.get("high") if q.get("high") is not None else r.get("high"),
+                "low": q.get("low") if q.get("low") is not None else r.get("low"),
+                "open": q.get("open") if q.get("open") is not None else r.get("open"),
+                "market_cap": r.get("market_cap"),
+                "industry": r.get("industry") or r.get("sector") or "—",
+                "market": "us",
+            })
+        return out
+    if market == "etf":
+        if factor_engine is None:
+            raise RuntimeError("factor_engine.py 不可用")
+        rows = factor_engine.fetch_sina_universe(
+            limit, exclude_st=False, node="etf_hq_fund", market="etf")
+        for r in rows:
+            out.append({
+                "symbol": r.get("symbol"), "code": r.get("code"),
+                "name": r.get("name") or r.get("code"),
+                "price": r.get("price"), "pct": r.get("pct"),
+                "amount": r.get("amount"), "volume": r.get("volume"),
+                "turnover": r.get("turnover"), "high": r.get("high"),
+                "low": r.get("low"), "open": r.get("open"),
+                "market_cap": None, "industry": "ETF", "market": "etf",
+            })
+        return out
+    raw = sina_fetch_candidates(f_min)
+    for r in raw:
+        out.append({
+            "symbol": r.get("symbol"), "code": r.get("code"),
+            "name": r.get("name") or r.get("code"),
+            "price": to_float(r.get("trade")), "pct": to_float(r.get("changepercent")),
+            "amount": to_float(r.get("amount"), 0), "volume": to_float(r.get("volume"), 0),
+            "turnover": to_float(r.get("turnoverratio")),
+            "high": to_float(r.get("high")), "low": to_float(r.get("low")),
+            "open": to_float(r.get("open")),
+            "market_cap": None, "industry": "", "market": "a",
+        })
+    return out
+
+
 _A_METRICS_CACHE = {}
 _A_METRICS_TTL = 60.0
 
@@ -277,12 +1424,17 @@ def fetch_a_metrics(symbol):
 # ---------------------------------------------------------------------------
 
 KLINE_URL = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={sym},day,,,{n},qfq"
+SINA_KLINE_URL = ("https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+                  "CN_MarketData.getKLineData?symbol={sym}&scale=240&ma=no&datalen={n}")
 KLINE_HDR = {"User-Agent": UA["User-Agent"], "Referer": "https://gu.qq.com/"}
 
 _KLINE_CACHE = {}       # symbol -> 昨日指标 dict(当日有效)
 _KLINE_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kline_cache.json")
 _KLINE_FAIL_TS = {}     # symbol -> 上次失败时间(负缓存, 避免反复重试打爆接口)
 _KLINE_FAIL_TTL = 600.0
+_KLINE_TENCENT_OFF_UNTIL = 0.0
+_KLINE_TENCENT_FAILS = 0
+_KLINE_TEN_LOCK = threading.Lock()
 
 
 def _kline_today_ref(mkt):
@@ -290,24 +1442,77 @@ def _kline_today_ref(mkt):
     美股交易日比北京日期晚约1天(收盘在北京凌晨), 以本地日期-36h 作参照。"""
     if mkt == "us":
         return time.strftime("%Y-%m-%d", time.localtime(time.time() - 36 * 3600))
+    if mkt == "cr":
+        return time.strftime("%Y-%m-%d", time.gmtime())
     return time.strftime("%Y-%m-%d")
 
 
-def fetch_daily_kline(symbol, n=12):
-    """腾讯日K(前复权): 返回 list[dict(date,open,close,high,low,volume)] 旧->新, 失败返回 []。
-    A股/港股直接用 sh/sz/bj/hk 前缀代码; 美股需带交易所后缀(如 usAAPL.OQ)。"""
+def _fetch_sina_daily_kline(symbol, n=12):
+    """腾讯限流时的日K回退(不复权, 成交量统一成手)。"""
     try:
-        raw = _http(KLINE_URL.format(sym=symbol, n=n), KLINE_HDR, timeout=8).decode("utf-8", "replace")
-        node = (json.loads(raw).get("data") or {}).get(symbol) or {}
-        arr = node.get("qfqday") or node.get("day") or []
+        raw = _http(SINA_KLINE_URL.format(sym=symbol, n=n), SINA_HDR, timeout=8)
+        arr = json.loads(raw.decode("utf-8", "replace"))
+        if not isinstance(arr, list):
+            return []
         out = []
-        for b in arr:
-            if isinstance(b, (list, tuple)) and len(b) >= 6:
-                out.append({"date": str(b[0]), "open": to_float(b[1]), "close": to_float(b[2]),
-                            "high": to_float(b[3]), "low": to_float(b[4]), "volume": to_float(b[5], 0)})
+        for x in arr:
+            if not isinstance(x, dict):
+                continue
+            date = str(x.get("day") or "")[:10]
+            o = to_float(x.get("open"))
+            c = to_float(x.get("close"))
+            h = to_float(x.get("high"))
+            l = to_float(x.get("low"))
+            v = to_float(x.get("volume"), 0)
+            if date and None not in (o, c, h, l):
+                out.append({"date": date, "open": o, "close": c, "high": h,
+                            "low": l, "volume": (v or 0) / 100.0})
         return out
     except Exception:
         return []
+
+
+def fetch_daily_kline(symbol, n=12):
+    """日K(腾讯前复权, 失败回退新浪): 返回 list[dict(date,open,close,high,low,volume)]
+    旧->新, 失败返回 []。A股/港股直接用 sh/sz/bj/hk 前缀代码;
+    美股需带交易所后缀(如 usAAPL.OQ); 加密用 crBTCUSDT。"""
+    if symbol.startswith("cr"):
+        return fetch_crypto_bars(symbol[2:], n)
+    global _KLINE_TENCENT_OFF_UNTIL, _KLINE_TENCENT_FAILS
+    if time.time() >= _KLINE_TENCENT_OFF_UNTIL:
+        try:
+            qsym = _us_tencent_code(symbol)
+            raw = _http(KLINE_URL.format(sym=qsym, n=n), KLINE_HDR, timeout=3).decode("utf-8", "replace")
+            node = (json.loads(raw).get("data") or {}).get(qsym) or {}
+            arr = node.get("qfqday") or node.get("day") or []
+            out = []
+            for b in arr:
+                if isinstance(b, (list, tuple)) and len(b) >= 6:
+                    out.append({"date": str(b[0]), "open": to_float(b[1]), "close": to_float(b[2]),
+                                "high": to_float(b[3]), "low": to_float(b[4]), "volume": to_float(b[5], 0)})
+            if out:
+                with _KLINE_TEN_LOCK:
+                    _KLINE_TENCENT_FAILS = 0
+                return out
+        except Exception:
+            pass
+        with _KLINE_TEN_LOCK:
+            _KLINE_TENCENT_FAILS += 1
+            if _KLINE_TENCENT_FAILS >= 3:
+                _KLINE_TENCENT_OFF_UNTIL = time.time() + 600
+    bars = _fetch_sina_daily_kline(symbol, n)
+    if bars:
+        return bars
+    if symbol.startswith("us"):
+        bars = _fetch_yahoo_daily(symbol, n)
+        if bars:
+            return bars
+        tick = _us_ticker(symbol)
+        if tick:
+            bars = fetch_nasdaq_daily(tick, n)
+            if bars:
+                return bars
+    return []
 
 
 def derive_prev_metrics(bars, today_ref):
@@ -573,12 +1778,451 @@ def open_bias_composite(rows, weights=FACTOR_WEIGHTS):
 
 
 def detail_url(mkt, disp):
-    """详情页: 美股雪球, A股/港股腾讯。"""
+    """详情页: 美股雪球, A股/港股腾讯, 加密货币 Binance。"""
     if mkt == "us":
         return f"https://xueqiu.com/S/{disp}"
     if mkt == "hk":
         return f"https://gu.qq.com/hk{disp}"
+    if mkt == "cr":
+        return f"https://www.binance.com/en/trade/{disp}USDT"
     return f"https://gu.qq.com/{mkt}{disp}"   # sh / sz / bj
+
+
+# ---------------------------------------------------------------------------
+# 综合评估: 基本面 + 消息面 + 技术面 + 买入区间
+# ---------------------------------------------------------------------------
+
+def is_etf(raw):
+    c = classify_symbol(raw)
+    if not c or c[2] not in ("sh", "sz"):
+        return False
+    code = c[1]
+    return code.startswith(("15", "16", "18", "50", "51", "52", "56", "58"))
+
+
+def fetch_tencent_fundamentals(tcode):
+    """腾讯长格式里的估值字段; 失败返回空。"""
+    if not tcode or tcode.startswith("cr"):
+        return {}
+    try:
+        raw = _http("https://qt.gtimg.cn/q=" + tcode, UA, timeout=6).decode("gbk", "replace")
+        p = raw.split('"')[1].split("~")
+        if len(p) < 50:
+            return {}
+        us = tcode.startswith("us")
+        pe = _raw_float(p[39])
+        pb = None if us else _raw_float(p[46] if not tcode.startswith("hk") else p[58])
+        mktcap = _raw_float(p[45]) or _raw_float(p[44])
+        turnover = _raw_float(p[38])
+        h52 = _raw_float(p[48] if us else p[47])
+        l52 = _raw_float(p[49] if us else p[48])
+        return {"pe": pe if pe and pe > 0 else None,
+                "pb": pb if pb and pb > 0 else None,
+                "mktcap": mktcap, "turnover": turnover,
+                "high52": h52, "low52": l52}
+    except Exception:
+        return {}
+
+
+def _eval_sma(vals, n):
+    return sum(vals[-n:]) / n if len(vals) >= n else None
+
+
+def _eval_ema(vals, n):
+    if not vals:
+        return []
+    k = 2.0 / (n + 1.0)
+    out = [vals[0]]
+    for x in vals[1:]:
+        out.append(out[-1] + (x - out[-1]) * k)
+    return out
+
+
+def _eval_rsi(closes, n=14):
+    if len(closes) <= n:
+        return None
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        d = closes[i] - closes[i - 1]
+        gains.append(max(d, 0.0))
+        losses.append(max(-d, 0.0))
+    ag = sum(gains[-n:]) / n
+    al = sum(losses[-n:]) / n
+    if al <= 0:
+        return 100.0
+    return 100.0 - 100.0 / (1.0 + ag / al)
+
+
+def _eval_atr(highs, lows, closes, n=14):
+    if len(closes) <= n:
+        return None
+    trs = []
+    for i in range(1, len(closes)):
+        trs.append(max(highs[i] - lows[i],
+                       abs(highs[i] - closes[i - 1]),
+                       abs(lows[i] - closes[i - 1])))
+    return sum(trs[-n:]) / n
+
+
+def technical_snapshot(bars, price=None):
+    bars = [b for b in bars if b.get("close") is not None]
+    if len(bars) < 25:
+        return {"bars": len(bars)}
+    closes = [b["close"] for b in bars]
+    highs = [b.get("high") or b["close"] for b in bars]
+    lows = [b.get("low") or b["close"] for b in bars]
+    vols = [b.get("volume") or 0 for b in bars]
+    price = price or closes[-1]
+    ma5, ma10 = _eval_sma(closes, 5), _eval_sma(closes, 10)
+    ma20, ma60 = _eval_sma(closes, 20), _eval_sma(closes, 60)
+    e12, e26 = _eval_ema(closes, 12), _eval_ema(closes, 26)
+    dif = [a - b for a, b in zip(e12, e26)]
+    dea = _eval_ema(dif, 9)
+    macd_hist = (dif[-1] - dea[-1]) if dif and dea else None
+    rsi = _eval_rsi(closes, 14)
+    atr = _eval_atr(highs, lows, closes, 14)
+    std20 = None
+    if len(closes) >= 20:
+        m = sum(closes[-20:]) / 20.0
+        std20 = math.sqrt(sum((x - m) ** 2 for x in closes[-20:]) / 20.0)
+    boll_up = (ma20 + 2 * std20) if (ma20 is not None and std20 is not None) else None
+    boll_low = (ma20 - 2 * std20) if (ma20 is not None and std20 is not None) else None
+    ret5 = closes[-1] / closes[-6] - 1 if len(closes) >= 6 else None
+    ret20 = closes[-1] / closes[-21] - 1 if len(closes) >= 21 else None
+    high20, low20 = max(highs[-20:]), min(lows[-20:])
+    high60 = max(highs[-60:]) if len(highs) >= 60 else high20
+    low60 = min(lows[-60:]) if len(lows) >= 60 else low20
+    vol20 = None
+    if len(closes) >= 21:
+        lr = [math.log(closes[i] / closes[i - 1]) for i in range(len(closes) - 20, len(closes))]
+        m = sum(lr) / len(lr)
+        vol20 = math.sqrt(sum((x - m) ** 2 for x in lr) / (len(lr) - 1)) * math.sqrt(252)
+    close_pos20 = ((closes[-1] - low20) / (high20 - low20)) if high20 > low20 else 0.5
+    trend = "震荡"
+    if ma20 is not None and ma60 is not None:
+        if price > ma20 > ma60:
+            trend = "多头"
+        elif price < ma20 < ma60:
+            trend = "空头"
+    atr = atr or price * 0.02
+    if price > high20 * 1.01:
+        style = "突破回踩"
+        buy_low = max(high20 - 0.3 * atr, price - 1.0 * atr)
+        buy_high = min(price, max(high20 + 0.2 * atr, buy_low + 0.4 * atr))
+    elif trend == "多头":
+        style = "趋势回调"
+        buy_low = max(low20, price - 1.5 * atr, (ma20 or low20) - 0.3 * atr)
+        buy_high = min(price, max((ma20 or price) + 0.5 * atr, buy_low + 0.6 * atr))
+    elif trend == "空头":
+        style = "等待企稳"
+        buy_low = max(low20, price - 1.5 * atr)
+        buy_high = min(price, max(buy_low + 0.5 * atr, (ma20 or price) - 1.0 * atr))
+    else:
+        style = "区间低吸"
+        buy_low = max(low20, price - 1.2 * atr, (ma20 or price) - 0.8 * atr)
+        buy_high = min(price, max(buy_low + 0.6 * atr, (ma20 or price) - 0.2 * atr))
+    if buy_high <= buy_low:
+        buy_high = min(price, buy_low * 1.01)
+    if buy_high <= buy_low:
+        buy_low, buy_high = price * 0.98, price
+    stop = buy_low - 0.8 * atr
+    resistance = high20 if high20 > price else high60
+    target = max(resistance, buy_high + 2 * atr)
+    return {
+        "bars": len(bars), "price": price,
+        "ma5": ma5, "ma10": ma10, "ma20": ma20, "ma60": ma60,
+        "rsi": rsi, "atr": atr, "macd_hist": macd_hist,
+        "boll_up": boll_up, "boll_low": boll_low,
+        "ret5": ret5, "ret20": ret20, "vol20": vol20,
+        "high20": high20, "low20": low20, "high60": high60, "low60": low60,
+        "close_pos20": close_pos20, "trend": trend, "style": style,
+        "buy_low": buy_low, "buy_high": buy_high, "stop": stop, "target": target,
+    }
+
+
+def _eval_price(v, mkt, etf):
+    if v is None:
+        return "--"
+    if mkt == "cr":
+        return fmt_crypto_price(v)
+    if etf:
+        return f"{v:.3f}"
+    return fmt_price(v)
+
+
+def collect_evaluation(code, quote=None, factor_row=None):
+    c = classify_symbol(code)
+    if not c:
+        return {"error": "无法识别该代码"}
+    tcode, disp, mkt = c
+    etf = is_etf(code)
+    if quote is None:
+        if mkt == "cr":
+            q, _ = fetch_crypto_quotes([code])
+        else:
+            q, _ = fetch_quotes_auto([(code, sina_code(code), tcode)])
+        quote = q.get(code)
+    bars = fetch_daily_kline(tcode, 120)
+    asof = bars[-1].get("date") if bars else ""
+    tech = technical_snapshot(bars, price=(quote or {}).get("price"))
+    fund = fetch_tencent_fundamentals(tcode)
+    ynews = []
+    if mkt == "cr":
+        fund = {"kind": "crypto"}
+    else:
+        fund["kind"] = "etf" if etf else "stock"
+        if mkt == "us":
+            tick = _us_ticker(tcode) or disp
+            with ThreadPoolExecutor(max_workers=3) as ex:
+                f_nas = ex.submit(fetch_nasdaq_summary, tick)
+                f_sec = ex.submit(fetch_sec_fundamentals, tick)
+                f_news = ex.submit(fetch_yahoo_news, tick, 6)
+                nas = f_nas.result()
+                sec = f_sec.result()
+                ynews = f_news.result()
+            if nas:
+                if nas.get("mktcap"):
+                    fund["mktcap"] = nas["mktcap"] / 1e8
+                for k in ("sector", "industry", "high52", "low52",
+                          "avg_volume", "one_year_target", "dividend", "yield"):
+                    if nas.get(k) is not None:
+                        fund[k] = nas[k]
+            if sec:
+                fund.update({k: v for k, v in sec.items() if v is not None})
+            pr = (quote or {}).get("price")
+            if pr and sec.get("eps") and fund.get("pe") is None:
+                fund["pe"] = pr / sec["eps"]
+            if pr and sec.get("equity") and sec.get("shares"):
+                bvps = sec["equity"] / sec["shares"]
+                if bvps > 0 and fund.get("pb") is None:
+                    fund["pb"] = pr / bvps
+    industry = ""
+    if mkt in ("sh", "sz", "bj") and not etf:
+        try:
+            industry = fetch_industry(tcode)
+        except Exception:
+            industry = ""
+    news, nstats = [], {"n_pos": 0, "n_neg": 0}
+    if mkt in ("sh", "sz", "bj", "hk", "us"):
+        try:
+            em_news, _em_stats = fetch_stock_news(mkt, disp, (quote or {}).get("qt_code", ""))
+        except Exception:
+            em_news = []
+        combined = []
+        seen = set()
+        for it in (ynews + em_news):
+            title = str(it.get("title") or "")
+            if title and title not in seen:
+                seen.add(title)
+                combined.append(it)
+        combined.sort(key=lambda x: x.get("time") or "", reverse=True)
+        news = combined[:12]
+        nstats = {"n_pos": sum(1 for x in news if x.get("impact") == "利好"),
+                  "n_neg": sum(1 for x in news if x.get("impact") == "利空")}
+    price = (quote or {}).get("price") or tech.get("price")
+    score = 50.0
+    if tech.get("ma20") is not None:
+        if price and price > tech["ma20"]:
+            score += 8
+        if tech.get("ma60") is not None and tech["ma20"] > tech["ma60"]:
+            score += 8
+        if tech.get("ma5") and tech["ma20"] and tech["ma5"] > tech["ma20"]:
+            score += 4
+        if tech.get("macd_hist") is not None and tech["macd_hist"] > 0:
+            score += 6
+        if tech.get("ret20") is not None and tech["ret20"] > 0:
+            score += 4
+        if tech.get("ret5") is not None and tech["ret5"] > 0:
+            score += 3
+        rsi = tech.get("rsi")
+        if rsi is not None:
+            if 45 <= rsi <= 70:
+                score += 4
+            elif rsi > 75:
+                score -= 6
+            elif rsi < 30:
+                score += 2
+        vol = tech.get("vol20")
+        if vol is not None:
+            if vol < 0.4:
+                score += 4
+            elif vol > 0.8:
+                score -= 5
+        if tech.get("close_pos20", 0.5) > 0.5:
+            score += 3
+    pe, pb = fund.get("pe"), fund.get("pb")
+    if pe is not None:
+        if pe < 30:
+            score += 2
+        elif pe > 80:
+            score -= 3
+    if pb is not None:
+        if pb < 5:
+            score += 1
+        elif pb > 10:
+            score -= 3
+    diff = nstats.get("n_pos", 0) - nstats.get("n_neg", 0)
+    score += max(-4, min(4, diff))
+    if factor_row:
+        adv = factor_row.get("advice")
+        if adv == "强候选":
+            score += 3
+        elif adv == "候选":
+            score += 2
+        elif adv == "观察":
+            score -= 2
+        elif adv == "回避":
+            score -= 6
+    score = max(0.0, min(95.0, score))
+    if score >= 75:
+        label = "偏多"
+    elif score >= 60:
+        label = "中性偏多"
+    elif score >= 45:
+        label = "中性"
+    elif score >= 35:
+        label = "偏弱"
+    else:
+        label = "回避"
+    action = "可在区间内分批；跌破止损放弃"
+    if tech.get("trend") == "空头" or score < 35:
+        action = "暂不买入，等待企稳或放量突破"
+    if factor_row and factor_row.get("advice") == "回避":
+        action = "因子标注回避，暂不买入"
+    zone_notes = []
+    if tech.get("buy_low") is not None:
+        if diff < 0:
+            zone_notes.append("消息面偏空")
+        if pe is not None and pe > 80:
+            zone_notes.append("PE偏高")
+        if pb is not None and pb > 10:
+            zone_notes.append("PB偏高")
+        if score < 45:
+            zone_notes.append("综合评分偏弱")
+        if zone_notes:
+            shift = 0.3 * (tech.get("atr") or 0)
+            low = max(tech.get("low20") or 0, tech["buy_low"] - shift)
+            high = max(low * 1.005, tech["buy_high"] - shift)
+            high = min(high, price) if price else high
+            tech["buy_low"], tech["buy_high"] = low, high
+            tech["stop"] = low - 0.8 * (tech.get("atr") or 0)
+        elif diff > 0 and score >= 60:
+            tech["buy_high"] = min(price, tech["buy_high"] + 0.1 * (tech.get("atr") or 0))
+            zone_notes.append("消息面偏正，区间略上移")
+        tech["zone_note"] = "；".join(zone_notes)
+    return {
+        "error": None, "code": code, "tcode": tcode, "disp": disp, "mkt": mkt,
+        "etf": etf, "name": (quote or {}).get("name") or disp,
+        "quote": quote or {}, "tech": tech, "fund": fund, "asof": asof,
+        "news": news, "nstats": nstats, "factor": factor_row,
+        "industry": industry,
+        "score": round(score), "label": label, "action": action,
+    }
+
+
+def format_evaluation(ev):
+    if ev.get("error"):
+        return [("warn", ev["error"])]
+    q, t, f = ev["quote"], ev["tech"], ev["fund"]
+    mkt, etf = ev["mkt"], ev["etf"]
+    pf = lambda v: _eval_price(v, mkt, etf)
+    market_label = "加密货币" if mkt == "cr" else ("ETF/LOF" if etf else MARKET_LABEL.get(mkt, mkt))
+    lines = []
+    add = lambda tag, text: lines.append((tag, text))
+    qpct = q.get("pct")
+    add("h", f"{ev['name']}  {ev['disp']}  ·  {market_label}")
+    add("muted", f"现价 {pf(q.get('price'))}  涨跌 "
+                 f"{('--' if qpct is None else f'{qpct:+.2f}%')}  ·  "
+                 f"数据日 {ev.get('asof') or '--'}")
+    add("h", "综合结论")
+    add("buy" if ev["score"] >= 60 else "sell" if ev["score"] < 35 else "warn",
+        f"综合评分 {ev['score']}/100 · {ev['label']}")
+    if ev.get("factor"):
+        fr = ev["factor"]
+        add("muted", f"因子标注：{fr.get('advice') or '—'}  "
+                     f"（得分 {fr.get('score'):.1f}，{fr.get('advice_reason') or ''}）")
+    if t.get("buy_low") is not None:
+        low, high = t["buy_low"], t["buy_high"]
+        p = q.get("price")
+        pull = ((low / p - 1) * 100) if p else None
+        add("buy", f"建议买入区间：{pf(low)} ~ {pf(high)}"
+                    + (f"（现价下方 {pull:+.1f}%）" if pull is not None else ""))
+        add("muted", f"止损参考 {pf(t['stop'])}  ·  目标参考 {pf(t['target'])}  ·  形态：{t['style']}")
+        if t.get("zone_note"):
+            add("warn", f"区间调整依据：{t['zone_note']}")
+    add("buy" if ev["score"] >= 60 else "warn", f"操作建议：{ev['action']}")
+
+    add("h", "基本面")
+    if f.get("kind") == "crypto":
+        add("muted", f"24h成交额 {fmt_amount(q.get('amount'))} · 24h量 {fmt_vol(q.get('volume'))}")
+        add("muted", "加密资产无公司 PE/PB/ROE，基本面维度按中性处理")
+    elif etf:
+        add("muted", f"规模/市值 {fmt_amount((f.get('mktcap') or 0) * 1e8)} · "
+                     f"换手 {fmt_pct_plain(f.get('turnover'))} · "
+                     f"52周 {pf(f.get('low52'))} ~ {pf(f.get('high52'))}")
+        add("muted", "ETF 无个股 PE/PB；重点看流动性、跟踪指数与折溢价")
+    else:
+        add("muted", f"PE {f.get('pe') if f.get('pe') is not None else '--'}  ·  "
+                     f"PB {f.get('pb') if f.get('pb') is not None else '--'}  ·  "
+                     f"总市值 {fmt_amount((f.get('mktcap') or 0) * 1e8)}  ·  "
+                     f"换手 {fmt_pct_plain(f.get('turnover'))}")
+        ind = ev.get("industry") or "/".join(
+            x for x in (f.get("sector"), f.get("industry")) if x) or "—"
+        add("muted", f"52周 {pf(f.get('low52'))} ~ {pf(f.get('high52'))}  ·  行业 {ind}")
+        sec_bits = []
+        if f.get("revenue_growth") is not None:
+            sec_bits.append(f"营收增长 {f['revenue_growth'] * 100:+.1f}%")
+        if f.get("net_margin") is not None:
+            sec_bits.append(f"净利率 {f['net_margin'] * 100:.1f}%")
+        if f.get("roe") is not None:
+            sec_bits.append(f"ROE {f['roe'] * 100:.1f}%")
+        if f.get("eps") is not None:
+            sec_bits.append(f"EPS {f['eps']:.2f}")
+        if sec_bits:
+            add("muted", "SEC财务：" + "  ·  ".join(sec_bits))
+        if f.get("yield") is not None or f.get("one_year_target") is not None:
+            bits = []
+            if f.get("yield") is not None:
+                bits.append(f"股息率 {f['yield']:.2f}%")
+            if f.get("one_year_target") is not None:
+                bits.append(f"1年目标 {pf(f['one_year_target'])}")
+            if f.get("avg_volume") is not None:
+                bits.append(f"平均量 {fmt_vol(f['avg_volume'])}")
+            add("muted", "  ·  ".join(bits))
+
+    add("h", "消息面（近24h）")
+    ns = ev.get("nstats") or {}
+    if ev["mkt"] == "cr":
+        add("muted", "加密货币暂无公司公告/资讯评分，消息面按中性处理")
+    else:
+        add("muted", f"利好 {ns.get('n_pos', 0)} 条 · 利空 {ns.get('n_neg', 0)} 条 · "
+                     f"中性 {max(0, len(ev.get('news') or []) - ns.get('n_pos', 0) - ns.get('n_neg', 0))} 条")
+        for it in (ev.get("news") or [])[:3]:
+            tag = "buy" if it.get("impact") == "利好" else (
+                "sell" if it.get("impact") == "利空" else "muted")
+            pub = it.get("publisher")
+            add(tag, f"· {it.get('time')}  {it.get('title')}"
+                     + (f"（{pub}）" if pub else ""))
+
+    add("h", "技术面")
+    if not t.get("ma20"):
+        add("warn", "日K数据不足，无法计算均线/ATR")
+    else:
+        add("muted", f"MA5 {pf(t.get('ma5'))}  MA10 {pf(t.get('ma10'))}  "
+                     f"MA20 {pf(t.get('ma20'))}  MA60 {pf(t.get('ma60'))}")
+        add("muted", f"RSI14 {('%.1f' % t['rsi']) if t.get('rsi') is not None else '--'}  ·  "
+                     f"MACD柱 {('%.3f' % t['macd_hist']) if t.get('macd_hist') is not None else '--'}  ·  "
+                     f"ATR% {('%.2f%%' % (t['atr'] / t['price'] * 100)) if t.get('atr') and t.get('price') else '--'}")
+        add("muted", f"20日波动 {('%.1f%%' % (t['vol20'] * 100)) if t.get('vol20') is not None else '--'}  ·  "
+                     f"20日支撑 {pf(t.get('low20'))} / 压力 {pf(t.get('high20'))}  ·  "
+                     f"60日区间 {pf(t.get('low60'))} ~ {pf(t.get('high60'))}")
+        add("muted", f"趋势 {t.get('trend')}  ·  收盘位置 {t.get('close_pos20', 0) * 100:.0f}%  "
+                     f"·  布林 {pf(t.get('boll_low'))} ~ {pf(t.get('boll_up'))}")
+
+    add("h", "风险提示")
+    add("warn", "区间基于均线/ATR/支撑压力估算；若放量跌破止损或出现重大利空，应放弃计划。")
+    add("warn", "本评价为研究参考，不构成投资建议；个股/ETF/加密均可能大幅波动。")
+    return lines
 
 
 # ---------------------------------------------------------------------------
@@ -595,10 +2239,16 @@ NEWS_NEGATIVE = (
     "减持", "预亏", "亏损", "立案", "处罚", "诉讼", "质押", "减值", "退市",
     "监管", "问询", "警示", "终止", "违约", "解禁", "辞职", "冻结", "调查",
     "谴责", "责令", "更正", "下调", "风险", "不及预期", "闪崩", "暴跌", "停产",
+    "downgrade", "cut", "miss", "lawsuit", "probe", "investigation", "recall",
+    "layoff", "warning", "plunge", "slump", "decline", "loss", "fraud",
+    "bankruptcy", "default", "halt", "delisted", "sell-off", "bearish", "weak",
 )
 NEWS_POSITIVE = (
     "回购", "增持", "中标", "签约", "预增", "扭亏", "分红", "派息", "股权激励",
     "收购", "重组", "涨价", "获批", "战略合作", "签订", "突破", "超预期", "新高", "强劲",
+    "upgrade", "beat", "surge", "rally", "buyback", "dividend", "raises",
+    "record", "growth", "profit", "approval", "partnership", "acquisition",
+    "bullish", "strong", "jump", "gain", "outperform",
 )
 
 _ANNOUNCE_CACHE = {}
@@ -612,11 +2262,12 @@ WATCH_NUMERIC_COLS = ("price", "change", "pct", "pct_prev", "delta", "open", "hi
 def classify_announcement(title):
     """按公告标题关键词标注影响: 利好 / 利空 / 中性。启发式, 仅作参考。"""
     t = title or ""
+    tl = t.lower()
     for kw in NEWS_NEGATIVE:
-        if kw in t:
+        if kw.lower() in tl:
             return "利空"
     for kw in NEWS_POSITIVE:
-        if kw in t:
+        if kw.lower() in tl:
             return "利好"
     return "中性"
 
@@ -890,7 +2541,7 @@ def _wc_code_of(value):
 class StockMonitorApp:
     def __init__(self, root):
         self.root = root
-        root.title("A股·港股·美股 行情监控 + 选股器 (延时行情)")
+        root.title("A股·ETF·港股·美股·加密 行情监控 + 选股/评估 (延时行情)")
         root.geometry("1420x760")
 
         self._stop = False
@@ -898,11 +2549,13 @@ class StockMonitorApp:
         self._refresh_event = threading.Event()
         self._lock = threading.Lock()
         self._screen_busy = False
+        self._screen_queue = queue.Queue()
 
         self.watchlist = []
         self.index_results = {}
         self.stock_results = {}      # symbol -> (data, market)
         self.last_update = ""
+        self.quote_source = ""
         self.cn_color = True
 
         # 选股器状态
@@ -922,6 +2575,11 @@ class StockMonitorApp:
         self._factor_busy = False
         self._factor_cancel = threading.Event()
         self._factor_queue = queue.Queue()
+        self._eval_busy = False
+        self._eval_queue = queue.Queue()
+        self._eval_last_code = ""
+        self._eval_last_report = ""
+        self._eval_last_lines = []
         self.factor_rows = []
         self.factor_stats = []
         self.factor_meta = {}
@@ -934,7 +2592,9 @@ class StockMonitorApp:
         self._load_config()
         self._build_ui()
         self._start_worker()
+        self.root.after(250, self._screen_pump)
         self.root.after(300, self._factor_pump)
+        self.root.after(350, self._eval_pump)
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ---------------- 配置 ----------------
@@ -945,6 +2605,9 @@ class StockMonitorApp:
             self.watchlist = [str(t).upper() for t in cfg.get("watchlist", DEFAULT_WATCHLIST)]
             self.interval = int(cfg.get("interval", 5))
             self.cn_color = bool(cfg.get("cn_color", True))
+            self.screen_market = str(cfg.get("screen_market", "a"))
+            if self.screen_market not in ("a", "us", "etf"):
+                self.screen_market = "a"
             self.wencai_cookie = str(cfg.get("wencai_cookie", ""))
             self.wencai_last_query = str(cfg.get("wencai_last_query", ""))
 
@@ -966,11 +2629,14 @@ class StockMonitorApp:
             self.factor_threshold = _cf("factor_threshold", 60.0, 0.0, 100.0)
             self.factor_exclude_st = bool(cfg.get("factor_exclude_st", True))
             self.factor_exclude_limit = bool(cfg.get("factor_exclude_limit", True))
+            _fm = str(cfg.get("factor_market", "all"))
+            self.factor_market = _fm if _fm in ("a", "etf", "crypto", "us", "all") else "all"
             self.factor_show_n = _ci("factor_show_n", 50, 20, 100)
         except Exception:
             self.watchlist = list(DEFAULT_WATCHLIST)
             self.interval = 5
             self.cn_color = True
+            self.screen_market = "a"
             self.wencai_cookie = ""
             self.wencai_last_query = ""
             self.factor_limit = 300
@@ -979,6 +2645,7 @@ class StockMonitorApp:
             self.factor_threshold = 60.0
             self.factor_exclude_st = True
             self.factor_exclude_limit = True
+            self.factor_market = "all"
             self.factor_show_n = 50
         self.interval = max(3, min(3600, self.interval))
 
@@ -987,6 +2654,7 @@ class StockMonitorApp:
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump({"watchlist": self.watchlist, "interval": self.interval,
                            "cn_color": self.cn_color,
+                           "screen_market": getattr(self, "screen_market", "a"),
                            "wencai_cookie": getattr(self, "wencai_cookie", ""),
                            "wencai_last_query": getattr(self, "wencai_last_query", ""),
                            "factor_limit": getattr(self, "factor_limit", 300),
@@ -995,6 +2663,7 @@ class StockMonitorApp:
                            "factor_threshold": getattr(self, "factor_threshold", 60.0),
                            "factor_exclude_st": getattr(self, "factor_exclude_st", True),
                            "factor_exclude_limit": getattr(self, "factor_exclude_limit", True),
+                           "factor_market": getattr(self, "factor_market", "a"),
                            "factor_show_n": getattr(self, "factor_show_n", 50)},
                           f, ensure_ascii=False, indent=2)
         except Exception as e:
@@ -1015,16 +2684,19 @@ class StockMonitorApp:
         self.tab_watch = ttk.Frame(nb)
         self.tab_screen = ttk.Frame(nb)
         self.tab_factor = ttk.Frame(nb)
+        self.tab_eval = ttk.Frame(nb)
         self.tab_feed = ttk.Frame(nb)
         self.tab_wencai = ttk.Frame(nb)
         nb.add(self.tab_watch, text="  自选盯盘  ")
         nb.add(self.tab_screen, text="  选股器(A股)  ")
         nb.add(self.tab_factor, text="  因子选股  ")
+        nb.add(self.tab_eval, text="  综合评估  ")
         nb.add(self.tab_feed, text="  7x24快讯  ")
         nb.add(self.tab_wencai, text="  问财选股  ")
         self._build_watch_tab()
         self._build_screen_tab()
         self._build_factor_tab()
+        self._build_eval_tab()
         self._build_feed_tab()
         self._build_wencai_tab()
 
@@ -1113,40 +2785,61 @@ class StockMonitorApp:
         with self._lock:
             syms = list(self.watchlist)
 
-        def get_symbol(sym):
+        items = []
+        crypto_syms = []
+        for sym in syms:
             c = classify_symbol(sym)
             if not c:
-                return sym, None, None
-            tcode, disp, mkt = c
-            try:
-                raw = _http("https://qt.gtimg.cn/q=" + tcode, UA).decode("gbk", "replace")
-                data = parse_tencent(raw)
-                # 昨日对比指标(带当日缓存); 美股日K需带交易所后缀(如 usAAPL.OQ)
-                ksym = ("us" + data["qt_code"]) if (mkt == "us" and data.get("qt_code")) else tcode
-                m = fetch_prev_metrics(ksym)
-                if m and m.get("p") is not None and data.get("pct") is not None:
-                    data["pct_prev"] = m["p"]
-                    data["delta"] = round(data["pct"] - m["p"], 2)
-                return sym, data, mkt
-            except Exception:
-                return sym, None, mkt
+                continue
+            if c[2] == "cr":
+                crypto_syms.append(sym)
+            else:
+                items.append((sym, sina_code(sym), c[0]))
+        for _name, tcode in INDEXES:
+            items.append((tcode, sina_code(tcode), tcode))
 
-        def get_index(tcode):
-            try:
-                raw = _http("https://qt.gtimg.cn/q=" + tcode, UA).decode("gbk", "replace")
-                return parse_tencent(raw)
-            except Exception:
-                return None
+        quotes, sources = fetch_quotes_auto(items)
+        crypto_quotes, _crypto_src = ({}, "")
+        if crypto_syms:
+            crypto_quotes, _crypto_src = fetch_crypto_quotes(crypto_syms)
+            quotes.update(crypto_quotes)
 
         stocks = {}
-        idx_list = []
-        with ThreadPoolExecutor(max_workers=10) as ex:
-            for sym, data, mkt in ex.map(get_symbol, syms):
-                if data is not None:
-                    stocks[sym] = (data, mkt)
-            idx_list = list(ex.map(get_index, [ix[1] for ix in INDEXES]))
-        indexes = {INDEXES[i][0]: idx_list[i] for i in range(len(INDEXES)) if idx_list[i]}
-        return {"stocks": stocks, "indexes": indexes}
+        prev_items = []
+        for sym in syms:
+            c = classify_symbol(sym)
+            if not c:
+                continue
+            data = quotes.get(sym)
+            if not data:
+                continue
+            _tcode, _disp, mkt = c
+            ksym = ("us" + data["qt_code"]) if (mkt == "us" and data.get("qt_code")) else c[0]
+            stocks[sym] = [data, mkt]
+            prev_items.append((sym, ksym))
+
+        def attach_prev(item):
+            sym, ksym = item
+            m = fetch_prev_metrics(ksym)
+            return sym, m
+
+        if prev_items:
+            with ThreadPoolExecutor(max_workers=20) as ex:
+                for sym, m in ex.map(attach_prev, prev_items):
+                    data = stocks.get(sym)
+                    if data and m and m.get("p") is not None and data[0].get("pct") is not None:
+                        data[0]["pct_prev"] = m["p"]
+                        data[0]["delta"] = round(data[0]["pct"] - m["p"], 2)
+        stocks = {k: tuple(v) for k, v in stocks.items()}
+
+        indexes = {}
+        for name, tcode in INDEXES:
+            data = quotes.get(tcode)
+            if data:
+                indexes[name] = data
+        return {"stocks": stocks, "indexes": indexes,
+                "source": f"新浪批量 {sources['sina']} · 腾讯回退 {sources['tencent']}"
+                          f" · Yahoo {sources.get('yahoo', 0)} · 加密 {len(crypto_quotes)}"}
 
     def _poll(self):
         try:
@@ -1155,6 +2848,7 @@ class StockMonitorApp:
                 self.stock_results = res.get("stocks", {})
                 self.index_results = res.get("indexes", {})
                 self.last_update = res.get("ts", "")
+                self.quote_source = res.get("source", self.quote_source)
                 self._render_indexes()
                 self._render_table()
         except queue.Empty:
@@ -1195,27 +2889,36 @@ class StockMonitorApp:
             d, _ = entry
             chg = d.get("change") or 0
             tag = "flat" if chg == 0 else ("up" if chg > 0 else "down")
+            etf = is_etf(sym)
+            if mkt == "cr":
+                pf, sf = fmt_crypto_price, fmt_crypto_signed
+            elif etf:
+                pf = lambda v: "--" if v is None else f"{v:.3f}"
+                sf = lambda v: "--" if v is None else f"{v:+.3f}"
+            else:
+                pf, sf = fmt_price, fmt_signed
             vals = (
-                MARKET_LABEL.get(mkt, "?"),
+                "ETF/LOF" if etf else MARKET_LABEL.get(mkt, "?"),
                 sym,
                 d.get("name") or "",
-                fmt_price(d.get("price")),
-                fmt_signed(d.get("change")),
+                pf(d.get("price")),
+                sf(d.get("change")),
                 fmt_pct(d.get("pct")),
                 fmt_pct(d.get("pct_prev")),
                 fmt_pct(d.get("delta")),
-                fmt_price(d.get("open")),
-                fmt_price(d.get("high")),
-                fmt_price(d.get("low")),
-                fmt_price(d.get("prev_close")),
+                pf(d.get("open")),
+                pf(d.get("high")),
+                pf(d.get("low")),
+                pf(d.get("prev_close")),
                 fmt_vol(d.get("volume")),
                 d.get("time") or "",
             )
             self.tree.insert("", "end", values=vals, tags=(tag,))
         n = len(syms)
         ok = len(self.stock_results)
+        src = self.quote_source or "新浪/腾讯自动"
         self.status_var.set(
-            f"数据源: 腾讯(延时) · 最后刷新 {self.last_update} · 共 {n} 只 · 正常 {ok} · "
+            f"数据源: {src} (延时) · 最后刷新 {self.last_update} · 共 {n} 只 · 正常 {ok} · "
             f"双击行打开详情页"
         )
 
@@ -1288,7 +2991,18 @@ class StockMonitorApp:
         top = ttk.Frame(self.tab_screen, padding=(8, 6))
         top.pack(fill="x")
 
-        ttk.Label(top, text="A股全市场选股", font=("Microsoft YaHei", 11, "bold")).pack(side="left")
+        _mkt_label = {"a": "A股全市场选股", "us": "美股全市场选股",
+                      "etf": "ETF选股"}.get(getattr(self, "screen_market", "a"), "A股全市场选股")
+        self.screen_title_var = tk.StringVar(value=_mkt_label)
+        ttk.Label(top, textvariable=self.screen_title_var,
+                  font=("Microsoft YaHei", 11, "bold")).pack(side="left")
+        ttk.Label(top, text="  市场").pack(side="left")
+        self.screen_market_var = tk.StringVar(
+            value={"a": "A股", "us": "美股", "etf": "ETF"}.get(
+                getattr(self, "screen_market", "a"), "A股"))
+        ttk.Combobox(top, textvariable=self.screen_market_var, width=6, state="readonly",
+                     values=("A股", "美股", "ETF")).pack(side="left", padx=2)
+        self.screen_market_var.trace_add("write", lambda *a: self._screen_market_changed())
 
         ttk.Label(top, text="  涨幅").pack(side="left")
         self.f_min_var = tk.StringVar(value="4.0")
@@ -1298,24 +3012,33 @@ class StockMonitorApp:
         ttk.Entry(top, textvariable=self.f_max_var, width=5).pack(side="left")
         ttk.Label(top, text="%").pack(side="left")
 
-        ttk.Label(top, text="   量比≥").pack(side="left")
+        self.f_x1_label = ttk.Label(top, text="   量比≥")
+        self.f_x1_label.pack(side="left")
         self.f_lb_var = tk.StringVar(value="1.5")
-        ttk.Entry(top, textvariable=self.f_lb_var, width=5).pack(side="left")
+        self.f_lb_entry = ttk.Entry(top, textvariable=self.f_lb_var, width=5)
+        self.f_lb_entry.pack(side="left")
 
-        ttk.Label(top, text="  换手率≥").pack(side="left")
+        self.f_x2_label = ttk.Label(top, text="  换手率≥")
+        self.f_x2_label.pack(side="left")
         self.f_hs_var = tk.StringVar(value="3.0")
-        ttk.Entry(top, textvariable=self.f_hs_var, width=5).pack(side="left")
-        ttk.Label(top, text="%").pack(side="left")
+        self.f_hs_entry = ttk.Entry(top, textvariable=self.f_hs_var, width=5)
+        self.f_hs_entry.pack(side="left")
+        self.f_x2_suffix = ttk.Label(top, text="%")
+        self.f_x2_suffix.pack(side="left")
 
         ttk.Label(top, text="  排序:").pack(side="left")
         self.sort_var = tk.StringVar(value="量比")
-        ttk.Combobox(top, textvariable=self.sort_var, width=8, state="readonly",
-                     values=("量比", "换手率", "涨跌幅", "昨涨幅", "涨幅差", "连涨",
-                             "24h消息", "买入信号", "成交额", "开盘倾向")).pack(side="left", padx=2)
+        self.screen_sort_combo = ttk.Combobox(
+            top, textvariable=self.sort_var, width=8, state="readonly",
+            values=("量比", "换手率", "涨跌幅", "昨涨幅", "涨幅差", "连涨",
+                    "24h消息", "买入信号", "成交额", "开盘倾向"))
+        self.screen_sort_combo.pack(side="left", padx=2)
 
         self.screen_btn = ttk.Button(top, text="查询", command=self._run_screen)
         self.screen_btn.pack(side="left", padx=6)
-        ttk.Button(top, text="转问财", command=self._screen_to_wencai).pack(side="left", padx=2)
+        self.screen_wencai_btn = ttk.Button(top, text="转问财",
+                                            command=self._screen_to_wencai)
+        self.screen_wencai_btn.pack(side="left", padx=2)
 
         self.screen_count_var = tk.StringVar(value="点击「查询」开始筛选")
         ttk.Label(top, textvariable=self.screen_count_var, foreground="#333").pack(side="left", padx=10)
@@ -1390,6 +3113,38 @@ class StockMonitorApp:
         ttk.Button(pg, text="跳转", command=self._screen_goto).pack(side="left", padx=2)
         ttk.Label(pg, text="黄底=买入候选 · 条件(4项共振): 倾向≥60 / 涨幅加速 / 连涨≥2 / 24h无利空",
                   foreground="#999").pack(side="left", padx=14)
+        self._screen_market_changed()
+
+    def _screen_market_changed(self):
+        if not hasattr(self, "screen_market_var"):
+            return
+        m = {"A股": "a", "美股": "us", "ETF": "etf"}.get(
+            self.screen_market_var.get(), "a")
+        self.screen_market = m
+        cfg = {
+            "a": ("A股全市场选股", "   量比≥", "  换手率≥", "%", "1.5", "3.0"),
+            "etf": ("ETF选股", "  成交额≥(亿)", "  换手率≥", "%", "1.0", "0.5"),
+            "us": ("美股全市场选股", "  成交额≥(百万$)", "  市值≥(亿$)", "", "50", "100"),
+        }[m]
+        self.screen_title_var.set(cfg[0])
+        self.f_x1_label.configure(text=cfg[1])
+        self.f_x2_label.configure(text=cfg[2])
+        self.f_x2_suffix.configure(text=cfg[3])
+        self.f_lb_var.set(cfg[4])
+        self.f_hs_var.set(cfg[5])
+        self.screen_wencai_btn.configure(state="normal" if m == "a" else "disabled")
+        vals = {
+            "a": ("量比", "换手率", "涨跌幅", "昨涨幅", "涨幅差", "连涨",
+                  "24h消息", "买入信号", "成交额", "开盘倾向"),
+            "etf": ("成交额", "换手率", "涨跌幅", "昨涨幅", "涨幅差", "连涨",
+                    "24h消息", "买入信号", "开盘倾向"),
+            "us": ("涨跌幅", "成交额", "昨涨幅", "涨幅差", "连涨",
+                   "24h消息", "买入信号", "开盘倾向"),
+        }[m]
+        self.screen_sort_combo.configure(values=vals)
+        if self.sort_var.get() not in vals:
+            self.sort_var.set(vals[0])
+        self.screen_count_var.set("选择条件后点「查询」")
 
     def _run_screen(self):
         if self._screen_busy:
@@ -1402,14 +3157,21 @@ class StockMonitorApp:
         try:
             f_min = float(self.f_min_var.get())
             f_max = float(self.f_max_var.get())
-            lb_min = float(self.f_lb_var.get())
-            hs_min = float(self.f_hs_var.get())
+            x1 = float(self.f_lb_var.get())
+            x2 = float(self.f_hs_var.get())
             p_min = opt_float(self.f_prev_min_var)
             p_max = opt_float(self.f_prev_max_var)
             st_min = opt_float(self.f_streak_var)
         except ValueError:
-            messagebox.showwarning("参数错误", "请填写数字: 涨幅区间 / 量比 / 换手率 / 昨日涨幅 / 连涨")
+            messagebox.showwarning("参数错误", "请填写数字: 涨幅区间 / 筛选条件 / 昨日涨幅 / 连涨")
             return
+        market = getattr(self, "screen_market", "a")
+        if market == "a":
+            lb_min, hs_min, amount_min, cap_min = x1, x2, 0, 0
+        elif market == "etf":
+            lb_min, hs_min, amount_min, cap_min = 0, x2, x1 * 1e8, 0
+        else:
+            lb_min, hs_min, amount_min, cap_min = 0, 0, x1 * 1e6, x2 * 1e8
         if f_min > f_max:
             f_min, f_max = f_max, f_min
         if p_min is not None and p_max is not None and p_min > p_max:
@@ -1424,32 +3186,62 @@ class StockMonitorApp:
         self.screen_btn.configure(state="disabled")
         self.screen_count_var.set("筛选中, 请稍候...")
 
+        sort_name = self.sort_var.get()
+
         def work():
             try:
-                self.root.after(0, lambda: self.screen_count_var.set("正在抓取 A股行情..."))
-                raw = sina_fetch_candidates(f_min)
-                # 第一段: 用新浪字段过滤 涨幅区间 + 换手率
+                label = {"a": "A股", "us": "美股", "etf": "ETF"}.get(market, market)
+                self._screen_queue.put(("status", f"正在抓取 {label} 行情..."))
+                raw = fetch_screen_universe(market, f_min)
+                # 第一段: 涨幅区间 + 市场对应的成交额/市值/换手率
                 cands = []
                 for r in raw:
-                    cp = to_float(r.get("changepercent"))
+                    cp = to_float(r.get("pct"))
                     if cp is None or not (f_min <= cp <= f_max):
                         continue
-                    hs = to_float(r.get("turnoverratio")) or 0.0
-                    if hs < hs_min:
+                    if amount_min and (r.get("amount") or 0) < amount_min:
+                        continue
+                    if cap_min and (r.get("market_cap") or 0) < cap_min:
+                        continue
+                    hs = to_float(r.get("turnover")) or 0.0
+                    if hs_min and hs < hs_min:
                         continue
                     cands.append(r)
                 # 第二段: 腾讯单只补齐量比(带 TTL 缓存)
-                self.root.after(0, lambda: self.screen_count_var.set(f"正在计算量比... ({len(cands)} 只)"))
-                def enrich(r):
-                    lb, _hs = fetch_a_metrics(r.get("symbol"))
-                    r["lb"] = lb
-                    return r
-                if cands:
-                    with ThreadPoolExecutor(max_workers=24) as ex:
-                        cands = list(ex.map(enrich, cands))
+                self._screen_queue.put(("status", f"正在批量补齐量比... ({len(cands)} 只)"))
+                if market in ("a", "etf") and cands:
+                    em_items = [(r.get("symbol"), em_quote_candidates(r.get("symbol")))
+                                for r in cands]
+                    em_quotes = fetch_em_quotes(em_items)
+                    for r in cands:
+                        q = em_quotes.get(r.get("symbol"))
+                        if q:
+                            if q.get("volume_ratio") is not None:
+                                r["lb"] = q["volume_ratio"]
+                            if q.get("turnover") is not None:
+                                r["hs"] = q["turnover"]
+
+                    def enrich(r):
+                        if r.get("lb") is not None and r.get("hs") is not None:
+                            return r
+                        lb, hs = fetch_a_metrics(r.get("symbol"))
+                        if lb is not None:
+                            r["lb"] = lb
+                        if hs is not None:
+                            r["hs"] = hs
+                        return r
+                    missing = [r for r in cands
+                               if r.get("lb") is None or r.get("hs") is None]
+                    if missing:
+                        with ThreadPoolExecutor(max_workers=24) as ex:
+                            list(ex.map(enrich, missing))
+                else:
+                    for r in cands:
+                        r["lb"] = 0.0
+                        r["hs"] = to_float(r.get("turnover")) or 0.0
                 # 第三段: 日K补齐「昨日」指标(昨涨幅/连涨/昨日量比, 当日缓存), 供对比过滤与打分
-                self.root.after(0, lambda: self.screen_count_var.set(
-                    f"正在抓取日K对比昨涨幅... ({len(cands)} 只)"))
+                self._screen_queue.put(("status",
+                                        f"正在抓取日K对比昨涨幅... ({len(cands)} 只)"))
 
                 def enrich_kline(r):
                     m = fetch_prev_metrics(r.get("symbol"))
@@ -1462,8 +3254,8 @@ class StockMonitorApp:
                     with ThreadPoolExecutor(max_workers=24) as ex:
                         cands = list(ex.map(enrich_kline, cands))
                 # 第四段: 24h消息面(东财个股资讯, 利好/利空计数), 参与过滤与打分
-                self.root.after(0, lambda: self.screen_count_var.set(
-                    f"正在抓取24h消息面... ({len(cands)} 只)"))
+                self._screen_queue.put(("status",
+                                        f"正在抓取24h消息面... ({len(cands)} 只)"))
 
                 def enrich_news(r):
                     sym = r.get("symbol") or ""
@@ -1480,7 +3272,7 @@ class StockMonitorApp:
                     lb = to_float(r.get("lb")) or 0.0
                     if lb < lb_min:
                         continue
-                    cp = to_float(r.get("changepercent"))
+                    cp = to_float(r.get("pct"))
                     pp = r.get("pct_prev")
                     # 昨日涨幅区间过滤(启用该条件时, 数据缺失的直接排除)
                     if p_min is not None and (pp is None or pp < p_min):
@@ -1502,7 +3294,7 @@ class StockMonitorApp:
                     rows.append({
                         "code": r.get("code"), "name": r.get("name"),
                         "symbol": r.get("symbol"),
-                        "price": to_float(r.get("trade")),
+                        "price": to_float(r.get("price")),
                         "pct": cp,
                         "pct_prev": pp,
                         "delta": delta,
@@ -1512,12 +3304,13 @@ class StockMonitorApp:
                         "news_neg": n_neg,
                         "news_score": n_pos - n_neg,
                         "lb": lb,
-                        "hs": to_float(r.get("turnoverratio")),
+                        "hs": to_float(r.get("hs")) or to_float(r.get("turnover")) or 0.0,
                         "amount": to_float(r.get("amount"), 0),
                         "volume": to_float(r.get("volume"), 0),
                         "high": to_float(r.get("high")),
                         "low": to_float(r.get("low")),
-                        "industry": "…",
+                        "industry": r.get("industry") or "…",
+                        "market": r.get("market") or market,
                     })
                 # 横截面多因子合成开盘倾向(分位排名 + 加权, 0~100)
                 open_bias_composite(rows)
@@ -1529,23 +3322,43 @@ class StockMonitorApp:
                 sort_key = {"量比": "lb", "换手率": "hs", "涨跌幅": "pct", "昨涨幅": "pct_prev",
                             "涨幅差": "delta", "连涨": "streak", "24h消息": "news_score",
                             "买入信号": "signal", "成交额": "amount", "开盘倾向": "bias"}
-                key = sort_key.get(self.sort_var.get(), "lb")
+                key = sort_key.get(sort_name, "lb")
                 rows.sort(key=lambda x: x.get(key) if x.get(key) is not None else -1e18, reverse=True)
                 # 先显示(行业占位为 …)
-                self.root.after(0, lambda: self._deliver(rows, final=False))
+                self._screen_queue.put(("deliver", rows, False))
                 # 第三段: 补齐行业(带缓存), 完成后更新
                 if rows:
                     def add_industry(row):
+                        if row.get("market") in ("us", "etf") or                                 row.get("industry") not in ("", "…", None):
+                            if not row.get("industry"):
+                                row["industry"] = "—"
+                            return row
                         row["industry"] = fetch_industry(row.get("symbol"))
                         return row
                     with ThreadPoolExecutor(max_workers=16) as ex:
                         rows = list(ex.map(add_industry, rows))
-                self.root.after(0, lambda: self._deliver(rows, final=True))
+                self._screen_queue.put(("deliver", rows, True))
             except Exception as e:
-                self.root.after(0, lambda: self._deliver([], final=True))
-                self.root.after(0, lambda: self.screen_count_var.set(f"查询失败: {e}"))
+                err = str(e)
+                self._screen_queue.put(("deliver", [], True))
+                self._screen_queue.put(("status", f"查询失败: {err}"))
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _screen_pump(self):
+        try:
+            while True:
+                item = self._screen_queue.get_nowait()
+                if item[0] == "status":
+                    self.screen_count_var.set(item[1])
+                elif item[0] == "deliver":
+                    self._deliver(item[1], item[2])
+        except queue.Empty:
+            pass
+        try:
+            self.root.after(200, self._screen_pump)
+        except Exception:
+            pass
 
     def _deliver(self, rows, final):
         self.screen_rows = rows
@@ -1737,11 +3550,17 @@ class StockMonitorApp:
     def _show_context_menu(self, event, code):
         menu = tk.Menu(self.root, tearoff=0)
         menu.add_command(label=f"复制代码 {code}", command=lambda: self._copy_code(code))
+        menu.add_command(label="查看分笔成交", command=lambda: self._open_ticks(code))
+        menu.add_command(label="综合评分/买入区间", command=lambda: self._open_evaluation(code))
         c = classify_symbol(code)
         mkt = c[2] if c else ""
-        menu.add_command(label="查看24h资讯", command=lambda: self._open_news24(code))
-        if mkt in ("sh", "sz", "bj"):
-            menu.add_command(label="查看公告消息", command=lambda: self._open_news(code))
+        if mkt == "cr":
+            menu.add_command(label="打开 Binance 行情",
+                             command=lambda: webbrowser.open(detail_url("cr", c[1])))
+        else:
+            menu.add_command(label="查看24h资讯", command=lambda: self._open_news24(code))
+            if mkt in ("sh", "sz", "bj"):
+                menu.add_command(label="查看公告消息", command=lambda: self._open_news(code))
         self._popup = menu
         try:
             menu.tk_popup(event.x_root, event.y_root)
@@ -1763,6 +3582,219 @@ class StockMonitorApp:
         self.stree.selection_set(row)
         code = self.stree.item(row, "values")[0]
         self._show_context_menu(event, code)
+
+    # ---------------- 综合评估弹窗 ----------------
+    def _open_evaluation(self, code):
+        c = classify_symbol(code)
+        if not c:
+            return
+        quote = None
+        entry = self.stock_results.get(code)
+        if entry:
+            quote = entry[0]
+        factor_row = None
+        for r in self.factor_rows:
+            if r.get("symbol") == c[0] or (r.get("code") == c[1]
+                                           and r.get("market") in (None, self.factor_market)):
+                factor_row = r
+                break
+
+        win = tk.Toplevel(self.root)
+        win.title(f"综合评估 - {c[1]}")
+        win.geometry("780x700")
+        win.transient(self.root)
+
+        hdr = ttk.Frame(win, padding=(8, 6))
+        hdr.pack(fill="x")
+        ttk.Label(hdr, text=f"{c[1]} 综合评估",
+                  font=("Microsoft YaHei", 11, "bold")).pack(side="left")
+        status_var = tk.StringVar(value="分析中...")
+        ttk.Label(hdr, textvariable=status_var, foreground="#666").pack(side="right")
+
+        tf = ttk.Frame(win, padding=(8, 4))
+        tf.pack(fill="both", expand=True)
+        text = tk.Text(tf, wrap="word", font=("Microsoft YaHei", 9),
+                       background="#fbfbfb", relief="flat", padx=10, pady=8)
+        vsb = ttk.Scrollbar(tf, orient="vertical", command=text.yview)
+        text.configure(yscrollcommand=vsb.set)
+        text.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        text.tag_configure("h", font=("Microsoft YaHei", 11, "bold"), spacing1=10, spacing3=4)
+        text.tag_configure("buy", foreground=COLOR_UP_DEFAULT)
+        text.tag_configure("sell", foreground=COLOR_DOWN_DEFAULT)
+        text.tag_configure("warn", foreground="#b36b00")
+        text.tag_configure("muted", foreground="#666666")
+        text.configure(state="disabled")
+
+        btns = ttk.Frame(win, padding=(8, 4))
+        btns.pack(fill="x")
+        refresh_btn = ttk.Button(btns, text="重新评估")
+        refresh_btn.pack(side="left")
+        copy_btn = ttk.Button(btns, text="复制报告",
+                              command=lambda: self._copy_text(text.get("1.0", "end").strip()))
+        copy_btn.pack(side="left", padx=6)
+        ttk.Label(btns, text="研究参考，不构成投资建议", foreground="#999").pack(side="right")
+
+        q = queue.Queue()
+        state = {"closed": False, "busy": False, "pump": None}
+
+        def render(ev, lines):
+            if state["closed"]:
+                return
+            text.configure(state="normal")
+            text.delete("1.0", "end")
+            for tag, line in lines:
+                text.insert("end", line + "\n", tag)
+            text.configure(state="disabled")
+            if ev.get("error"):
+                status_var.set(ev["error"])
+            else:
+                status_var.set(f"评分 {ev['score']}/100 · {ev['label']} · "
+                               f"{time.strftime('%H:%M:%S')}")
+            state["busy"] = False
+            refresh_btn.configure(state="normal")
+
+        def pump():
+            if state["closed"]:
+                return
+            try:
+                while True:
+                    ev, lines = q.get_nowait()
+                    render(ev, lines)
+            except queue.Empty:
+                pass
+            state["pump"] = win.after(200, pump)
+
+        def run():
+            if state["busy"]:
+                return
+            state["busy"] = True
+            refresh_btn.configure(state="disabled")
+            status_var.set("分析中...")
+
+            def work():
+                try:
+                    ev = collect_evaluation(code, quote=quote, factor_row=factor_row)
+                    q.put((ev, format_evaluation(ev)))
+                except Exception as e:
+                    q.put(({"error": f"评估失败: {e}"}, [("warn", f"评估失败: {e}")]))
+
+            threading.Thread(target=work, daemon=True).start()
+
+        def close():
+            state["closed"] = True
+            aid = state.get("pump")
+            if aid:
+                try:
+                    win.after_cancel(aid)
+                except Exception:
+                    pass
+            win.destroy()
+
+        refresh_btn.configure(command=run)
+        win.protocol("WM_DELETE_WINDOW", close)
+        pump()
+        run()
+
+    def _copy_text(self, value):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(value)
+        self.root.update()
+
+    # ---------------- 分笔成交弹窗 ----------------
+    def _open_ticks(self, code):
+        c = classify_symbol(code)
+        if not c:
+            return
+        _tcode, disp, _mkt = c
+        pf = fmt_crypto_price if _mkt == "cr" else fmt_price
+        win = tk.Toplevel(self.root)
+        win.title(f"分笔/分时 - {disp}")
+        win.geometry("620x560")
+        win.transient(self.root)
+
+        hdr = ttk.Frame(win, padding=(8, 6))
+        hdr.pack(fill="x")
+        ttk.Label(hdr, text=f"{disp} 分笔/分时 · 自动刷新 5 秒",
+                  font=("Microsoft YaHei", 10, "bold")).pack(side="left")
+        source_var = tk.StringVar(value="加载中...")
+        ttk.Label(hdr, textvariable=source_var, foreground="#666").pack(side="right")
+
+        cols = ("time", "price", "volume", "direction")
+        headers = ("时间", "价格", "量", "方向")
+        widths = (120, 100, 100, 70)
+        tf = ttk.Frame(win, padding=(8, 4))
+        tf.pack(fill="both", expand=True)
+        tree = ttk.Treeview(tf, columns=cols, show="headings")
+        for col, h, w in zip(cols, headers, widths):
+            tree.heading(col, text=h)
+            tree.column(col, width=w, anchor="e")
+        tree.column("time", anchor="w")
+        vsb = ttk.Scrollbar(tf, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        tree.tag_configure("buy", foreground=COLOR_UP_DEFAULT)
+        tree.tag_configure("sell", foreground=COLOR_DOWN_DEFAULT)
+        tree.tag_configure("flat", foreground=COLOR_FLAT)
+        ttk.Label(win, text="量为数据源原始单位（A股通常为手）；仅作行情参考，不构成投资建议",
+                  foreground="#999").pack(anchor="w", padx=10, pady=(0, 6))
+
+        state = {"closed": False, "after": None, "pump": None}
+        tick_q = queue.Queue()
+
+        def render(rows, src):
+            if state["closed"]:
+                return
+            if rows:
+                tree.delete(*tree.get_children())
+                for r in rows[-300:]:
+                    d = r.get("direction") or "中性"
+                    tag = "buy" if d == "买" else ("sell" if d == "卖" else "flat")
+                    tree.insert("", "end", values=(
+                        r.get("time") or "", pf(r.get("price")),
+                        fmt_vol(r.get("volume")), d), tags=(tag,))
+                source_var.set(f"数据源: {src or '—'} · {len(rows)} 笔 · "
+                               f"刷新 {time.strftime('%H:%M:%S')}")
+            else:
+                source_var.set(f"暂无数据/重试中 · {time.strftime('%H:%M:%S')}")
+
+        def pump():
+            if state["closed"]:
+                return
+            try:
+                while True:
+                    rows, src = tick_q.get_nowait()
+                    render(rows, src)
+            except queue.Empty:
+                pass
+            state["pump"] = win.after(200, pump)
+
+        def refresh():
+            if state["closed"]:
+                return
+
+            def work():
+                rows, src = fetch_ticks(code, 50)
+                tick_q.put((rows, src))
+
+            threading.Thread(target=work, daemon=True).start()
+            state["after"] = win.after(5000, refresh)
+
+        def close():
+            state["closed"] = True
+            for key in ("after", "pump"):
+                aid = state.get(key)
+                if aid:
+                    try:
+                        win.after_cancel(aid)
+                    except Exception:
+                        pass
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", close)
+        pump()
+        refresh()
 
     # ---------------- 公告消息弹窗 ----------------
     def _open_news(self, code):
@@ -1942,12 +3974,126 @@ class StockMonitorApp:
         if url:
             webbrowser.open(url)
 
+    # ================ 综合评估 ================
+    def _build_eval_tab(self):
+        top = ttk.Frame(self.tab_eval, padding=(8, 6))
+        top.pack(fill="x")
+        ttk.Label(top, text="综合评估", font=("Microsoft YaHei", 11, "bold")).pack(side="left")
+        ttk.Label(top, text="  代码").pack(side="left")
+        self.eval_code_var = tk.StringVar(value=self._eval_last_code or "600519")
+        ent = ttk.Entry(top, textvariable=self.eval_code_var, width=14)
+        ent.pack(side="left", padx=2)
+        ent.bind("<Return>", lambda e: self._run_eval_tab())
+        self.eval_btn = ttk.Button(top, text="评估", command=self._run_eval_tab)
+        self.eval_btn.pack(side="left", padx=6)
+        ttk.Button(top, text="复制报告", command=self._copy_eval_report).pack(side="left", padx=2)
+        for code in ("AAPL", "600519", "510300", "BTC"):
+            ttk.Button(top, text=code, width=7,
+                       command=lambda c=code: self._eval_example(c)).pack(side="left", padx=1)
+        self.eval_status_var = tk.StringVar(
+            value="支持 美股 / A股 / 港股 / ETF / 加密货币；输入代码后回车或点评估")
+        ttk.Label(self.tab_eval, textvariable=self.eval_status_var,
+                  foreground="#666", padding=(8, 2)).pack(fill="x")
+
+        tf = ttk.Frame(self.tab_eval, padding=(8, 4))
+        tf.pack(fill="both", expand=True)
+        self.eval_text = tk.Text(tf, wrap="word", font=("Microsoft YaHei", 9),
+                                 background="#fbfbfb", relief="flat", padx=12, pady=10)
+        vsb = ttk.Scrollbar(tf, orient="vertical", command=self.eval_text.yview)
+        self.eval_text.configure(yscrollcommand=vsb.set)
+        self.eval_text.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        self.eval_text.tag_configure("h", font=("Microsoft YaHei", 11, "bold"),
+                                     spacing1=12, spacing3=4)
+        self.eval_text.tag_configure("buy", foreground=COLOR_UP_DEFAULT)
+        self.eval_text.tag_configure("sell", foreground=COLOR_DOWN_DEFAULT)
+        self.eval_text.tag_configure("warn", foreground="#b36b00")
+        self.eval_text.tag_configure("muted", foreground="#666666")
+        self.eval_text.configure(state="disabled")
+        if self._eval_last_lines:
+            self._render_eval_tab_lines(self._eval_last_lines)
+
+    def _eval_example(self, code):
+        self.eval_code_var.set(code)
+        self._run_eval_tab()
+
+    def _run_eval_tab(self):
+        if self._eval_busy:
+            return
+        code = self.eval_code_var.get().strip()
+        c = classify_symbol(code)
+        if not c:
+            messagebox.showinfo("提示", "无法识别该代码，示例：AAPL / 600519 / 510300 / BTC / cr:PEPE")
+            return
+        quote = self.stock_results.get(code) or self.stock_results.get(c[1])
+        quote = quote[0] if quote else None
+        factor_row = None
+        for r in self.factor_rows:
+            if r.get("symbol") == c[0] or r.get("code") == c[1]:
+                factor_row = r
+                break
+        self._eval_busy = True
+        self.eval_btn.configure(state="disabled")
+        self.eval_status_var.set(f"正在评估 {code} ...")
+
+        def work():
+            try:
+                ev = collect_evaluation(code, quote=quote, factor_row=factor_row)
+                self._eval_queue.put(("ok", ev, format_evaluation(ev)))
+            except Exception as e:
+                self._eval_queue.put(("err", str(e), None))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _eval_pump(self):
+        try:
+            while True:
+                kind, ev, lines = self._eval_queue.get_nowait()
+                if kind == "ok":
+                    self._eval_last_code = ev.get("code") or self.eval_code_var.get()
+                    self._eval_last_report = "\n".join(line for _tag, line in lines)
+                    self._eval_last_lines = lines
+                    self._render_eval_tab_lines(lines)
+                    self.eval_status_var.set(
+                        f"{ev.get('name')} · 评分 {ev.get('score')}/100 · {ev.get('label')} · "
+                        f"{time.strftime('%H:%M:%S')}")
+                else:
+                    self.eval_status_var.set(f"评估失败: {ev}")
+                self._eval_busy = False
+                self.eval_btn.configure(state="normal")
+        except queue.Empty:
+            pass
+        try:
+            self.root.after(250, self._eval_pump)
+        except Exception:
+            pass
+
+    def _render_eval_tab_lines(self, lines):
+        self.eval_text.configure(state="normal")
+        self.eval_text.delete("1.0", "end")
+        for tag, line in lines:
+            self.eval_text.insert("end", line + "\n", tag)
+        self.eval_text.configure(state="disabled")
+
+    def _copy_eval_report(self):
+        if not self._eval_last_report:
+            return
+        self._copy_text(self._eval_last_report)
+
     # ================ 因子选股 ================
     def _build_factor_tab(self):
         top = ttk.Frame(self.tab_factor, padding=(8, 6))
         top.pack(fill="x")
         ttk.Label(top, text="因子选股", font=("Microsoft YaHei", 11, "bold")).pack(side="left")
-        ttk.Label(top, text="  股票池(成交额前)").pack(side="left")
+        ttk.Label(top, text="  市场").pack(side="left")
+        self.factor_market_var = tk.StringVar(
+            value={"a": "个股", "etf": "ETF", "crypto": "加密货币",
+                   "us": "美股", "all": "个股+ETF"}.get(
+                getattr(self, "factor_market", "all"), "个股+ETF"))
+        ttk.Combobox(top, textvariable=self.factor_market_var, width=8, state="readonly",
+                     values=("个股+ETF", "个股", "ETF", "美股", "加密货币")).pack(side="left", padx=2)
+        self.factor_market_var.trace_add("write", lambda *a: self._factor_market_changed())
+        ttk.Label(top, text="  池(成交额前)").pack(side="left")
         self.factor_limit_var = tk.StringVar(value=str(self.factor_limit))
         ttk.Combobox(top, textvariable=self.factor_limit_var, width=6, state="readonly",
                      values=("150", "300", "500")).pack(side="left", padx=2)
@@ -1961,9 +4107,15 @@ class StockMonitorApp:
                      values=("1", "5")).pack(side="left", padx=2)
         ttk.Label(top, text="日").pack(side="left")
         self.factor_exclude_st_var = tk.BooleanVar(value=self.factor_exclude_st)
-        ttk.Checkbutton(top, text="排除ST", variable=self.factor_exclude_st_var).pack(side="left", padx=6)
+        self.factor_st_chk = ttk.Checkbutton(top, text="排除ST",
+                                             variable=self.factor_exclude_st_var)
+        self.factor_st_chk.pack(side="left", padx=6)
         self.factor_exclude_limit_var = tk.BooleanVar(value=self.factor_exclude_limit)
-        ttk.Checkbutton(top, text="排除涨停", variable=self.factor_exclude_limit_var).pack(side="left", padx=2)
+        self.factor_limit_chk = ttk.Checkbutton(top, text="排除涨停",
+                                                variable=self.factor_exclude_limit_var)
+        self.factor_limit_chk.pack(side="left", padx=2)
+        self.factor_buy_only_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(top, text="仅看买入候选", variable=self.factor_buy_only_var).pack(side="left", padx=4)
         ttk.Label(top, text="  得分≥").pack(side="left")
         self.factor_threshold_var = tk.StringVar(value=f"{self.factor_threshold:g}")
         ttk.Entry(top, textvariable=self.factor_threshold_var, width=5).pack(side="left")
@@ -1972,13 +4124,14 @@ class StockMonitorApp:
         self.factor_cancel_btn = ttk.Button(top, text="取消", command=self._factor_cancel_cmd,
                                             state="disabled")
         self.factor_cancel_btn.pack(side="left", padx=2)
+        ttk.Button(top, text="评价选中", command=self._eval_selected_factor).pack(side="left", padx=2)
 
         info = ttk.Frame(self.tab_factor, padding=(8, 0))
         info.pack(fill="x")
         self.factor_status_var = tk.StringVar(
             value="点击「运行」: 抓取成交额前 N 只日K, 计算 RankIC/ICIR 并做样本外检验")
         ttk.Label(info, textvariable=self.factor_status_var, foreground="#333").pack(side="left")
-        ttk.Label(info, text="股票池=今日成交额前N · Top20模拟计成本/剔涨停 · 历史IC含选择偏差 · 仅供研究",
+        ttk.Label(info, text="次日建议为研究候选 · 样本外证据不足时自动降级 · 不构成投资建议",
                   foreground="#999").pack(side="right")
 
         paned = ttk.Panedwindow(self.tab_factor, orient="vertical")
@@ -2016,12 +4169,16 @@ class StockMonitorApp:
         ttk.Label(rf_top, text="只 · 点击表头排序 · 双击打开详情 · 右键复制/资讯/公告",
                   foreground="#999").pack(side="left", padx=6)
         self.factor_show_var.trace_add("write", lambda *a: self._render_factor_results())
+        self.factor_buy_only_var.trace_add("write", lambda *a: self._render_factor_results())
 
-        rcols = ("rank", "code", "name", "price", "pct", "score", "mom", "trend",
-                 "vol", "liq", "pattern", "market", "top", "industry", "asof")
-        rheaders = ("排名", "代码", "名称", "现价", "涨跌幅", "因子得分", "动量", "趋势",
-                    "波动", "流动性", "形态", "市场", "主要贡献", "行业", "数据日")
-        rwidths = (44, 66, 96, 70, 68, 66, 52, 52, 52, 56, 52, 52, 210, 80, 80)
+        rcols = ("rank", "code", "name", "price", "pct", "score", "advice", "evidence",
+                 "mom", "trend", "vol", "liq", "pattern", "market",
+                 "top", "industry", "asof")
+        rheaders = ("排名", "代码", "名称", "现价", "涨跌幅", "因子得分", "次日建议", "模型证据",
+                    "动量", "趋势", "波动", "流动性", "形态", "市场",
+                    "主要贡献", "行业", "数据日")
+        rwidths = (44, 66, 96, 70, 68, 62, 84, 62, 50, 50, 50, 54, 50, 50,
+                   200, 78, 78)
         self.factor_cols = rcols
         self.factor_headers = dict(zip(rcols, rheaders))
         rbox = ttk.Frame(rf)
@@ -2044,9 +4201,14 @@ class StockMonitorApp:
         self.factor_tree.tag_configure("down", foreground=COLOR_DOWN_DEFAULT)
         self.factor_tree.tag_configure("flat", foreground=COLOR_FLAT)
         self.factor_tree.tag_configure("hot", background="#eef7ee")
+        self.factor_tree.tag_configure("adv_strong", background="#ffd24d")
+        self.factor_tree.tag_configure("adv_buy", background="#fff2a6")
+        self.factor_tree.tag_configure("adv_caution", background="#e8f4ff")
+        self.factor_tree.tag_configure("adv_avoid", background="#eeeeee")
         self.factor_tree.bind("<Double-1>", self._open_factor_detail)
         self.factor_tree.bind("<Button-3>", self._on_factor_right_click)
         paned.add(rf, weight=3)
+        self._factor_market_changed()
 
     def _sync_factor_settings(self):
         if not hasattr(self, "factor_limit_var"):
@@ -2071,7 +4233,23 @@ class StockMonitorApp:
                                                        self.factor_threshold)))
         self.factor_exclude_st = bool(self.factor_exclude_st_var.get())
         self.factor_exclude_limit = bool(self.factor_exclude_limit_var.get())
+        self.factor_market = {"个股+ETF": "all", "个股": "a", "ETF": "etf",
+                              "美股": "us", "加密货币": "crypto"}.get(
+            self.factor_market_var.get(), "all")
         self.factor_show_n = max(20, min(100, iv(self.factor_show_var, self.factor_show_n)))
+
+    def _factor_market_changed(self):
+        if not hasattr(self, "factor_market_var"):
+            return
+        m = {"个股+ETF": "all", "个股": "a", "ETF": "etf",
+             "美股": "us", "加密货币": "crypto"}.get(
+            self.factor_market_var.get(), "all")
+        self.factor_market = m
+        if hasattr(self, "factor_st_chk"):
+            self.factor_st_chk.configure(state="normal" if m in ("a", "all") else "disabled")
+        if hasattr(self, "factor_limit_chk"):
+            self.factor_limit_chk.configure(
+                state="normal" if m in ("a", "etf", "all") else "disabled")
 
     def _run_factor(self):
         if self._factor_busy:
@@ -2086,6 +4264,7 @@ class StockMonitorApp:
         horizon = self.factor_horizon
         exclude_st = self.factor_exclude_st
         exclude_limit = self.factor_exclude_limit
+        market = self.factor_market
         threshold = self.factor_threshold
         self._factor_busy = True
         self._factor_cancel.clear()
@@ -2101,8 +4280,9 @@ class StockMonitorApp:
                 result = factor_engine.run_factor_screen(
                     limit=limit, lookback=lookback, horizon=horizon,
                     exclude_st=exclude_st, exclude_limit_up=exclude_limit,
-                    threshold=threshold,
-                    workers=4, progress_cb=progress,
+                    threshold=threshold, market=market,
+                    workers=10 if market == "us" else 4,
+                    progress_cb=progress,
                     cancel_event=self._factor_cancel)
                 self._factor_queue.put(("done", result))
             except factor_engine.Cancelled:
@@ -2181,6 +4361,10 @@ class StockMonitorApp:
         parts = [f"候选 {len(self.factor_rows)} 只",
                  f"入选因子 {meta.get('selected', 0)}/{len(self.factor_stats)}",
                  f"截至 {meta.get('asof') or '--'}"]
+        n_strong = sum(1 for r in self.factor_rows if r.get("advice") == "强候选")
+        n_buy = sum(1 for r in self.factor_rows if r.get("advice") in ("强候选", "候选"))
+        n_caution = sum(1 for r in self.factor_rows if r.get("advice") == "谨慎候选")
+        parts.append(f"次日买入候选 {n_buy}（强 {n_strong}，谨慎 {n_caution}）")
         if oos is not None:
             parts.append(f"样本外IC {oos:+.3f}")
         if eq is not None:
@@ -2194,8 +4378,6 @@ class StockMonitorApp:
             parts.append(f"{meta['elapsed']:.0f}s")
         text = " · ".join(parts)
         warns = list(meta.get("warnings") or [])
-        if oos is not None and eq is not None and oos < eq:
-            warns.append("样本外未跑赢等权基准")
         if warns:
             text += " · " + "；".join(warns)
         return text
@@ -2300,6 +4482,11 @@ class StockMonitorApp:
     def _factor_result_sort_value(self, r, col):
         if col in ("rank", "price", "pct", "score", "coverage"):
             return r.get(col)
+        if col == "advice":
+            return {"强候选": 5, "候选": 4, "谨慎候选": 3,
+                    "观察": 2, "回避": 1, "数据不足": 0}.get(r.get("advice"), 0)
+        if col == "evidence":
+            return 1 if r.get("evidence") == "正向" else 0
         cat_key = {"mom": "momentum", "trend": "trend", "vol": "volatility",
                    "liq": "liquidity", "pattern": "pattern", "market": "market"}.get(col)
         if cat_key:
@@ -2334,6 +4521,15 @@ class StockMonitorApp:
         self._update_factor_result_headings()
         self._render_factor_results()
 
+    def _eval_selected_factor(self):
+        sel = self.factor_tree.selection()
+        if not sel:
+            messagebox.showinfo("提示", "请先在结果表中选择一只标的")
+            return
+        vals = self.factor_tree.item(sel[0], "values")
+        if len(vals) >= 2:
+            self._open_evaluation(str(vals[1]))
+
     def _factor_show_n(self):
         try:
             return max(20, min(100, int(self.factor_show_var.get())))
@@ -2344,6 +4540,9 @@ class StockMonitorApp:
         self.factor_tree.delete(*self.factor_tree.get_children())
         if not self.factor_rows:
             return
+        rows = self.factor_rows
+        if self.factor_buy_only_var.get():
+            rows = [r for r in rows if r.get("advice") in ("强候选", "候选")]
         cat_keys = (("mom", "momentum"), ("trend", "trend"), ("vol", "volatility"),
                     ("liq", "liquidity"), ("pattern", "pattern"), ("market", "market"))
 
@@ -2351,20 +4550,33 @@ class StockMonitorApp:
             v = (r.get("cat_scores") or {}).get(key)
             return "--" if v is None else f"{v:.0f}"
 
-        for r in self.factor_rows[:self._factor_show_n()]:
+        adv_short = {"强候选": "★强候选", "候选": "候选", "谨慎候选": "谨慎",
+                     "观察": "观察", "回避": "回避", "数据不足": "数据不足"}
+        adv_tag = {"强候选": "adv_strong", "候选": "adv_buy",
+                   "谨慎候选": "adv_caution", "回避": "adv_avoid",
+                   "数据不足": "adv_avoid"}
+        for r in rows[:self._factor_show_n()]:
             score = r.get("score")
             pct = r.get("pct")
             label = "up" if (pct or 0) > 0 else ("down" if (pct or 0) < 0 else "flat")
-            tags = (label,)
-            if score is not None and score >= 80:
-                tags = ("hot",) + tags
+            advice = r.get("advice") or "观察"
+            tags = ((adv_tag[advice],) if advice in adv_tag else ()) + (label,)
+            _mkt = r.get("market")
+            if _mkt == "crypto":
+                pf = fmt_crypto_price
+            elif _mkt == "etf" or is_etf(r.get("symbol") or r.get("code") or ""):
+                pf = lambda v: "--" if v is None else f"{v:.3f}"
+            else:
+                pf = fmt_price
             vals = (
                 r.get("rank") or "",
                 r.get("code") or "",
                 r.get("name") or "",
-                fmt_price(r.get("price")),
+                pf(r.get("price")),
                 fmt_pct(pct),
                 "--" if score is None else f"{score:.1f}",
+                adv_short.get(advice, advice),
+                r.get("evidence") or "—",
             ) + tuple(cat_text(r, k) for _c, k in cat_keys) + (
                 r.get("top") or "—",
                 r.get("industry") or "—",
@@ -2638,6 +4850,9 @@ class StockMonitorApp:
             webbrowser.open(detail_url(mkt, disp))
 
     def _screen_to_wencai(self):
+        if getattr(self, "screen_market", "a") != "a":
+            messagebox.showinfo("提示", "问财选股仅支持 A股；美股/ETF 请直接用本地筛选")
+            return
         """把选股器当前条件翻译成问财自然语言查询, 并跳转到问财页。"""
         def f(var):
             try:
