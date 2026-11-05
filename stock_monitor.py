@@ -2538,6 +2538,59 @@ def _wc_code_of(value):
 # 主窗口
 # ---------------------------------------------------------------------------
 
+class FlowFrame(ttk.Frame):
+    """按可用宽度自动换行的控件容器。"""
+
+    def __init__(self, master=None, padding=0, **kw):
+        super().__init__(master, padding=padding, **kw)
+        self._items = []
+        self._last_width = 0
+        self._pending = None
+        self.bind("<Configure>", self._on_configure)
+
+    def add(self, widget, padx=2):
+        self._items.append((widget, padx))
+        self._schedule()
+        return widget
+
+    def _schedule(self):
+        if self._pending:
+            try:
+                self.after_cancel(self._pending)
+            except Exception:
+                pass
+        self._pending = self.after(30, self._reflow)
+
+    def _on_configure(self, event):
+        if abs(event.width - self._last_width) >= 8:
+            self._schedule()
+
+    def _reflow(self):
+        self._pending = None
+        width = self.winfo_width()
+        if width <= 1:
+            return
+        self._last_width = width
+        row = col = 0
+        x = 0
+        def span(pad):
+            if isinstance(pad, (tuple, list)):
+                return sum(v for v in pad if isinstance(v, (int, float)))
+            return pad * 2
+
+        for w, pad in self._items:
+            if not w.winfo_exists():
+                continue
+            rw = max(w.winfo_reqwidth(), w.winfo_width())
+            if col and x + rw + span(pad) > width:
+                row += 1
+                col = 0
+                x = 0
+            w.grid(row=row, column=col, sticky="w", padx=pad, pady=1)
+            x += rw + span(pad)
+            col += 1
+
+
 class StockMonitorApp:
     def __init__(self, root):
         self.root = root
@@ -2584,6 +2637,7 @@ class StockMonitorApp:
         self.factor_stats = []
         self.factor_meta = {}
         self.factor_wf = {}
+        self.factor_vol_stats = {}
         self.factor_sort_col = None
         self.factor_sort_desc = True
         self.factor_stat_sort_col = None
@@ -2629,6 +2683,15 @@ class StockMonitorApp:
             self.factor_threshold = _cf("factor_threshold", 60.0, 0.0, 100.0)
             self.factor_exclude_st = bool(cfg.get("factor_exclude_st", True))
             self.factor_exclude_limit = bool(cfg.get("factor_exclude_limit", True))
+            _ma = str(cfg.get("factor_ma", "全部"))
+            _ma = {"上20": "站上MA20", "下20": "跌破MA20"}.get(_ma, _ma)
+            _valid = ("全部", "站上MA5", "跌破MA5", "站上MA10", "跌破MA10",
+                      "站上MA20", "跌破MA20", "站上MA60", "跌破MA60")
+            self.factor_ma = _ma if _ma in _valid else "全部"
+            _vol = str(cfg.get("factor_vol", "全部"))
+            _vvalid = ("全部", "≈1倍(0.8~1.2)", "0.5~1.5倍",
+                       "放量≥1.5倍", "放量≥2倍", "放量≥3倍", "缩量≤0.8倍")
+            self.factor_vol = _vol if _vol in _vvalid else "全部"
             _fm = str(cfg.get("factor_market", "all"))
             self.factor_market = _fm if _fm in ("a", "etf", "crypto", "us", "all") else "all"
             self.factor_show_n = _ci("factor_show_n", 50, 20, 100)
@@ -2645,6 +2708,8 @@ class StockMonitorApp:
             self.factor_threshold = 60.0
             self.factor_exclude_st = True
             self.factor_exclude_limit = True
+            self.factor_ma = "全部"
+            self.factor_vol = "全部"
             self.factor_market = "all"
             self.factor_show_n = 50
         self.interval = max(3, min(3600, self.interval))
@@ -2663,6 +2728,8 @@ class StockMonitorApp:
                            "factor_threshold": getattr(self, "factor_threshold", 60.0),
                            "factor_exclude_st": getattr(self, "factor_exclude_st", True),
                            "factor_exclude_limit": getattr(self, "factor_exclude_limit", True),
+                           "factor_ma": getattr(self, "factor_ma", "全部"),
+                           "factor_vol": getattr(self, "factor_vol", "全部"),
                            "factor_market": getattr(self, "factor_market", "a"),
                            "factor_show_n": getattr(self, "factor_show_n", 50)},
                           f, ensure_ascii=False, indent=2)
@@ -2988,60 +3055,54 @@ class StockMonitorApp:
 
     # ================ 选股器 ================
     def _build_screen_tab(self):
-        top = ttk.Frame(self.tab_screen, padding=(8, 6))
+        top = FlowFrame(self.tab_screen, padding=(8, 6))
         top.pack(fill="x")
+        add = top.add
 
         _mkt_label = {"a": "A股全市场选股", "us": "美股全市场选股",
                       "etf": "ETF选股"}.get(getattr(self, "screen_market", "a"), "A股全市场选股")
         self.screen_title_var = tk.StringVar(value=_mkt_label)
-        ttk.Label(top, textvariable=self.screen_title_var,
-                  font=("Microsoft YaHei", 11, "bold")).pack(side="left")
-        ttk.Label(top, text="  市场").pack(side="left")
+        add(ttk.Label(top, textvariable=self.screen_title_var,
+                      font=("Microsoft YaHei", 11, "bold")), padx=(0, 8))
+        add(ttk.Label(top, text="市场"))
         self.screen_market_var = tk.StringVar(
             value={"a": "A股", "us": "美股", "etf": "ETF"}.get(
                 getattr(self, "screen_market", "a"), "A股"))
-        ttk.Combobox(top, textvariable=self.screen_market_var, width=6, state="readonly",
-                     values=("A股", "美股", "ETF")).pack(side="left", padx=2)
+        add(ttk.Combobox(top, textvariable=self.screen_market_var, width=6,
+                         state="readonly", values=("A股", "美股", "ETF")))
         self.screen_market_var.trace_add("write", lambda *a: self._screen_market_changed())
 
-        ttk.Label(top, text="  涨幅").pack(side="left")
+        add(ttk.Label(top, text="涨幅"))
         self.f_min_var = tk.StringVar(value="4.0")
-        ttk.Entry(top, textvariable=self.f_min_var, width=5).pack(side="left")
-        ttk.Label(top, text="% ~ ").pack(side="left")
+        add(ttk.Entry(top, textvariable=self.f_min_var, width=5))
+        add(ttk.Label(top, text="% ~"))
         self.f_max_var = tk.StringVar(value="5.0")
-        ttk.Entry(top, textvariable=self.f_max_var, width=5).pack(side="left")
-        ttk.Label(top, text="%").pack(side="left")
+        add(ttk.Entry(top, textvariable=self.f_max_var, width=5))
+        add(ttk.Label(top, text="%"))
 
-        self.f_x1_label = ttk.Label(top, text="   量比≥")
-        self.f_x1_label.pack(side="left")
+        self.f_x1_label = add(ttk.Label(top, text="量比≥"))
         self.f_lb_var = tk.StringVar(value="1.5")
-        self.f_lb_entry = ttk.Entry(top, textvariable=self.f_lb_var, width=5)
-        self.f_lb_entry.pack(side="left")
+        self.f_lb_entry = add(ttk.Entry(top, textvariable=self.f_lb_var, width=5))
 
-        self.f_x2_label = ttk.Label(top, text="  换手率≥")
-        self.f_x2_label.pack(side="left")
+        self.f_x2_label = add(ttk.Label(top, text="换手率≥"))
         self.f_hs_var = tk.StringVar(value="3.0")
-        self.f_hs_entry = ttk.Entry(top, textvariable=self.f_hs_var, width=5)
-        self.f_hs_entry.pack(side="left")
-        self.f_x2_suffix = ttk.Label(top, text="%")
-        self.f_x2_suffix.pack(side="left")
+        self.f_hs_entry = add(ttk.Entry(top, textvariable=self.f_hs_var, width=5))
+        self.f_x2_suffix = add(ttk.Label(top, text="%"))
 
-        ttk.Label(top, text="  排序:").pack(side="left")
+        add(ttk.Label(top, text="排序"))
         self.sort_var = tk.StringVar(value="量比")
-        self.screen_sort_combo = ttk.Combobox(
+        self.screen_sort_combo = add(ttk.Combobox(
             top, textvariable=self.sort_var, width=8, state="readonly",
             values=("量比", "换手率", "涨跌幅", "昨涨幅", "涨幅差", "连涨",
-                    "24h消息", "买入信号", "成交额", "开盘倾向"))
-        self.screen_sort_combo.pack(side="left", padx=2)
+                    "24h消息", "买入信号", "成交额", "开盘倾向")))
 
-        self.screen_btn = ttk.Button(top, text="查询", command=self._run_screen)
-        self.screen_btn.pack(side="left", padx=6)
-        self.screen_wencai_btn = ttk.Button(top, text="转问财",
-                                            command=self._screen_to_wencai)
-        self.screen_wencai_btn.pack(side="left", padx=2)
-
+        self.screen_btn = add(ttk.Button(top, text="查询",
+                                         command=self._run_screen), padx=6)
+        self.screen_wencai_btn = add(ttk.Button(top, text="转问财",
+                                                command=self._screen_to_wencai))
         self.screen_count_var = tk.StringVar(value="点击「查询」开始筛选")
-        ttk.Label(top, textvariable=self.screen_count_var, foreground="#333").pack(side="left", padx=10)
+        add(ttk.Label(top, textvariable=self.screen_count_var, foreground="#333"),
+            padx=(10, 0))
 
         # 第二行: 当日 vs 昨日 对比条件(量化筛股)
         top2 = ttk.Frame(self.tab_screen, padding=(8, 0))
@@ -4082,49 +4143,68 @@ class StockMonitorApp:
 
     # ================ 因子选股 ================
     def _build_factor_tab(self):
-        top = ttk.Frame(self.tab_factor, padding=(8, 6))
+        top = FlowFrame(self.tab_factor, padding=(8, 6))
         top.pack(fill="x")
-        ttk.Label(top, text="因子选股", font=("Microsoft YaHei", 11, "bold")).pack(side="left")
-        ttk.Label(top, text="  市场").pack(side="left")
+        add = top.add
+
+        add(ttk.Label(top, text="因子选股",
+                      font=("Microsoft YaHei", 11, "bold")), padx=(0, 8))
+        add(ttk.Label(top, text="市场"))
         self.factor_market_var = tk.StringVar(
             value={"a": "个股", "etf": "ETF", "crypto": "加密货币",
                    "us": "美股", "all": "个股+ETF"}.get(
                 getattr(self, "factor_market", "all"), "个股+ETF"))
-        ttk.Combobox(top, textvariable=self.factor_market_var, width=8, state="readonly",
-                     values=("个股+ETF", "个股", "ETF", "美股", "加密货币")).pack(side="left", padx=2)
+        add(ttk.Combobox(top, textvariable=self.factor_market_var, width=8,
+                         state="readonly",
+                         values=("个股+ETF", "个股", "ETF", "美股", "加密货币")))
         self.factor_market_var.trace_add("write", lambda *a: self._factor_market_changed())
-        ttk.Label(top, text="  池(成交额前)").pack(side="left")
+        add(ttk.Label(top, text="池(成交额前)"))
         self.factor_limit_var = tk.StringVar(value=str(self.factor_limit))
-        ttk.Combobox(top, textvariable=self.factor_limit_var, width=6, state="readonly",
-                     values=("150", "300", "500")).pack(side="left", padx=2)
-        ttk.Label(top, text="只  回看").pack(side="left")
+        add(ttk.Combobox(top, textvariable=self.factor_limit_var, width=6,
+                         state="readonly", values=("150", "300", "500")))
+        add(ttk.Label(top, text="回看"))
         self.factor_lookback_var = tk.StringVar(value=str(self.factor_lookback))
-        ttk.Combobox(top, textvariable=self.factor_lookback_var, width=6, state="readonly",
-                     values=("120", "250")).pack(side="left", padx=2)
-        ttk.Label(top, text="日  预测").pack(side="left")
+        add(ttk.Combobox(top, textvariable=self.factor_lookback_var, width=6,
+                         state="readonly", values=("120", "250")))
+        add(ttk.Label(top, text="预测"))
         self.factor_horizon_var = tk.StringVar(value=str(self.factor_horizon))
-        ttk.Combobox(top, textvariable=self.factor_horizon_var, width=4, state="readonly",
-                     values=("1", "5")).pack(side="left", padx=2)
-        ttk.Label(top, text="日").pack(side="left")
+        add(ttk.Combobox(top, textvariable=self.factor_horizon_var, width=4,
+                         state="readonly", values=("1", "5")))
+        add(ttk.Label(top, text="日"))
         self.factor_exclude_st_var = tk.BooleanVar(value=self.factor_exclude_st)
-        self.factor_st_chk = ttk.Checkbutton(top, text="排除ST",
-                                             variable=self.factor_exclude_st_var)
-        self.factor_st_chk.pack(side="left", padx=6)
+        self.factor_st_chk = add(ttk.Checkbutton(top, text="排除ST",
+                                                 variable=self.factor_exclude_st_var))
         self.factor_exclude_limit_var = tk.BooleanVar(value=self.factor_exclude_limit)
-        self.factor_limit_chk = ttk.Checkbutton(top, text="排除涨停",
-                                                variable=self.factor_exclude_limit_var)
-        self.factor_limit_chk.pack(side="left", padx=2)
+        self.factor_limit_chk = add(ttk.Checkbutton(top, text="排除涨停",
+                                                    variable=self.factor_exclude_limit_var))
         self.factor_buy_only_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(top, text="仅看买入候选", variable=self.factor_buy_only_var).pack(side="left", padx=4)
-        ttk.Label(top, text="  得分≥").pack(side="left")
+        add(ttk.Checkbutton(top, text="仅看买入候选",
+                            variable=self.factor_buy_only_var))
+        add(ttk.Label(top, text="MA"))
+        self.factor_ma_var = tk.StringVar(value=getattr(self, "factor_ma", "全部"))
+        add(ttk.Combobox(top, textvariable=self.factor_ma_var, width=10,
+                         state="readonly",
+                         values=("全部", "站上MA5", "跌破MA5", "站上MA10", "跌破MA10",
+                                 "站上MA20", "跌破MA20", "站上MA60", "跌破MA60")))
+        self.factor_ma_var.trace_add("write", lambda *a: self._factor_ma_changed())
+        add(ttk.Label(top, text="量/前2日"))
+        self.factor_vol_var = tk.StringVar(value=getattr(self, "factor_vol", "全部"))
+        add(ttk.Combobox(top, textvariable=self.factor_vol_var, width=12,
+                         state="readonly",
+                         values=("全部", "≈1倍(0.8~1.2)", "0.5~1.5倍",
+                                 "放量≥1.5倍", "放量≥2倍", "放量≥3倍",
+                                 "缩量≤0.8倍")))
+        self.factor_vol_var.trace_add("write", lambda *a: self._factor_vol_changed())
+        add(ttk.Label(top, text="得分≥"))
         self.factor_threshold_var = tk.StringVar(value=f"{self.factor_threshold:g}")
-        ttk.Entry(top, textvariable=self.factor_threshold_var, width=5).pack(side="left")
-        self.factor_run_btn = ttk.Button(top, text="运行", command=self._run_factor)
-        self.factor_run_btn.pack(side="left", padx=6)
-        self.factor_cancel_btn = ttk.Button(top, text="取消", command=self._factor_cancel_cmd,
-                                            state="disabled")
-        self.factor_cancel_btn.pack(side="left", padx=2)
-        ttk.Button(top, text="评价选中", command=self._eval_selected_factor).pack(side="left", padx=2)
+        add(ttk.Entry(top, textvariable=self.factor_threshold_var, width=5))
+        self.factor_run_btn = add(ttk.Button(top, text="运行",
+                                             command=self._run_factor), padx=6)
+        self.factor_cancel_btn = add(ttk.Button(top, text="取消",
+                                                command=self._factor_cancel_cmd,
+                                                state="disabled"))
+        add(ttk.Button(top, text="评价选中", command=self._eval_selected_factor))
+        add(ttk.Button(top, text="量能回测", command=self._show_volume_analysis))
 
         info = ttk.Frame(self.tab_factor, padding=(8, 0))
         info.pack(fill="x")
@@ -4171,14 +4251,14 @@ class StockMonitorApp:
         self.factor_show_var.trace_add("write", lambda *a: self._render_factor_results())
         self.factor_buy_only_var.trace_add("write", lambda *a: self._render_factor_results())
 
-        rcols = ("rank", "code", "name", "price", "pct", "score", "advice", "evidence",
-                 "mom", "trend", "vol", "liq", "pattern", "market",
-                 "top", "industry", "asof")
-        rheaders = ("排名", "代码", "名称", "现价", "涨跌幅", "因子得分", "次日建议", "模型证据",
-                    "动量", "趋势", "波动", "流动性", "形态", "市场",
-                    "主要贡献", "行业", "数据日")
-        rwidths = (44, 66, 96, 70, 68, 62, 84, 62, 50, 50, 50, 54, 50, 50,
-                   200, 78, 78)
+        rcols = ("rank", "code", "name", "price", "pct", "score", "ma", "vol2",
+                 "advice", "evidence", "mom", "trend", "vol", "liq",
+                 "pattern", "market", "top", "industry", "asof")
+        rheaders = ("排名", "代码", "名称", "现价", "涨跌幅", "因子得分", "均线", "量/前2日",
+                    "次日建议", "模型证据", "动量", "趋势", "波动", "流动性",
+                    "形态", "市场", "主要贡献", "行业", "数据日")
+        rwidths = (44, 66, 96, 70, 68, 62, 92, 76, 84, 62, 50, 50, 50, 54,
+                   50, 50, 200, 78, 78)
         self.factor_cols = rcols
         self.factor_headers = dict(zip(rcols, rheaders))
         rbox = ttk.Frame(rf)
@@ -4233,10 +4313,33 @@ class StockMonitorApp:
                                                        self.factor_threshold)))
         self.factor_exclude_st = bool(self.factor_exclude_st_var.get())
         self.factor_exclude_limit = bool(self.factor_exclude_limit_var.get())
+        _ma = self.factor_ma_var.get() or "全部"
+        _ma = {"上20": "站上MA20", "下20": "跌破MA20"}.get(_ma, _ma)
+        _valid = ("全部", "站上MA5", "跌破MA5", "站上MA10", "跌破MA10",
+                  "站上MA20", "跌破MA20", "站上MA60", "跌破MA60")
+        self.factor_ma = _ma if _ma in _valid else "全部"
+        _vol = self.factor_vol_var.get() or "全部"
+        _vvalid = ("全部", "≈1倍(0.8~1.2)", "0.5~1.5倍",
+                   "放量≥1.5倍", "放量≥2倍", "放量≥3倍", "缩量≤0.8倍")
+        self.factor_vol = _vol if _vol in _vvalid else "全部"
         self.factor_market = {"个股+ETF": "all", "个股": "a", "ETF": "etf",
                               "美股": "us", "加密货币": "crypto"}.get(
             self.factor_market_var.get(), "all")
         self.factor_show_n = max(20, min(100, iv(self.factor_show_var, self.factor_show_n)))
+
+    def _factor_ma_changed(self):
+        _ma = self.factor_ma_var.get() or "全部"
+        _ma = {"上20": "站上MA20", "下20": "跌破MA20"}.get(_ma, _ma)
+        _valid = ("全部", "站上MA5", "跌破MA5", "站上MA10", "跌破MA10",
+                  "站上MA20", "跌破MA20", "站上MA60", "跌破MA60")
+        self.factor_ma = _ma if _ma in _valid else "全部"
+        if self.factor_rows:
+            self._render_factor_results()
+
+    def _factor_vol_changed(self):
+        self.factor_vol = self.factor_vol_var.get() or "全部"
+        if self.factor_rows:
+            self._render_factor_results()
 
     def _factor_market_changed(self):
         if not hasattr(self, "factor_market_var"):
@@ -4326,6 +4429,7 @@ class StockMonitorApp:
         self.factor_stats = result.get("factor_stats") or []
         self.factor_meta = result.get("meta") or {}
         self.factor_wf = result.get("walk_forward") or {}
+        self.factor_vol_stats = result.get("volume_analysis") or {}
         self.factor_sort_col = None
         self.factor_sort_desc = True
         self.factor_stat_sort_col = None
@@ -4381,6 +4485,75 @@ class StockMonitorApp:
         if warns:
             text += " · " + "；".join(warns)
         return text
+
+    def _show_volume_analysis(self):
+        st = self.factor_vol_stats or {}
+        if not st.get("n_pairs"):
+            messagebox.showinfo("提示", "请先运行一次因子选股，再查看量能回测")
+            return
+        win = tk.Toplevel(self.root)
+        win.title("量能回测 · 当日量/前2日量")
+        win.geometry("760x620")
+        win.transient(self.root)
+        tf = ttk.Frame(win, padding=(8, 6))
+        tf.pack(fill="both", expand=True)
+        text = tk.Text(tf, wrap="word", font=("Consolas", 9),
+                       background="#fbfbfb", relief="flat", padx=10, pady=8)
+        vsb = ttk.Scrollbar(tf, orient="vertical", command=text.yview)
+        text.configure(yscrollcommand=vsb.set)
+        text.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        text.tag_configure("h", font=("Microsoft YaHei", 11, "bold"), spacing1=10)
+        text.tag_configure("buy", foreground=COLOR_UP_DEFAULT)
+        text.tag_configure("muted", foreground="#666666")
+        text.tag_configure("warn", foreground="#b36b00")
+        lines = []
+        add = lambda tag, line: lines.append((tag, line))
+        add("h", "量能回测：当日成交量 / 前2日成交量")
+        add("muted", f"样本：{st.get('n_dates', 0)} 个交易日 · "
+                     f"{st.get('n_pairs', 0):,} 个样本对")
+        base = st.get("baseline")
+        hit = st.get("hit")
+        add("muted", f"基准次日收益 {('--' if base is None else f'{base:+.2%}')}  ·  "
+                     f"基准命中率 {('--' if hit is None else f'{hit:.1%}')}")
+        add("muted", f"日度 RankIC {st.get('mean_ic') if st.get('mean_ic') is None else f'{st[chr(109)+chr(101)+chr(97)+chr(110)+chr(95)+chr(105)+chr(99)]:+.3f}'}  ·  "
+                     f"ICIR {('--' if st.get('icir') is None else f'{st[chr(105)+chr(99)+chr(105)+chr(114)]:+.2f}')}  ·  "
+                     f"t {('--' if st.get('t') is None else f'{st[chr(116)]:+.2f}')}")
+        add("h", "分桶统计（按量/前2日倍数）")
+        add("muted", f"{'区间':<12}{'样本':>10}{'平均收益':>12}{'命中率':>10}{'超额':>12}{'t':>8}")
+        for b in st.get("buckets") or []:
+            add("muted", f"{b['range']:<12}{b['n']:>10}{self._fmt_eval_pct(b.get('mean')):>12}"
+                         f"{self._fmt_eval_hit(b.get('hit')):>10}{self._fmt_eval_pct(b.get('excess')):>12}"
+                         f"{self._fmt_eval_t(b.get('t')):>8}")
+        add("h", "阈值扫描（≥N倍）")
+        add("muted", f"{'阈值':<10}{'样本':>10}{'平均收益':>12}{'命中率':>10}{'超额':>12}{'t':>8}")
+        for b in st.get("thresholds") or []:
+            add("muted", f"≥{b['threshold']:<9g}{b['n']:>10}{self._fmt_eval_pct(b.get('mean')):>12}"
+                         f"{self._fmt_eval_hit(b.get('hit')):>10}{self._fmt_eval_pct(b.get('excess')):>12}"
+                         f"{self._fmt_eval_t(b.get('t')):>8}")
+        best = st.get("best")
+        add("h", "回测结论")
+        if best:
+            add("buy", f"推荐关注：放量 ≥{best['threshold']:g} 倍  "
+                       f"（样本 {best['n']:,}，平均 {self._fmt_eval_pct(best.get('mean'))}，"
+                       f"超额 {self._fmt_eval_pct(best.get('excess'))}，t={self._fmt_eval_t(best.get('t'))}）")
+        else:
+            add("warn", "没有阈值同时满足样本量与正超额，暂不建议单独作为买入指标")
+        add("warn", "说明：这是历史横截面统计，不是严格回测；不同市场/周期的最优倍数可能不同，"
+                    "请结合因子评分、MA20 与消息面使用。")
+        text.configure(state="normal")
+        for tag, line in lines:
+            text.insert("end", line + "\n", tag)
+        text.configure(state="disabled")
+
+    def _fmt_eval_pct(self, v):
+        return "--" if v is None else f"{v:+.2%}"
+
+    def _fmt_eval_hit(self, v):
+        return "--" if v is None else f"{v:.1%}"
+
+    def _fmt_eval_t(self, v):
+        return "--" if v is None else f"{v:+.2f}"
 
     def _start_factor_industry_fill(self):
         rows = self.factor_rows[:50]
@@ -4482,6 +4655,10 @@ class StockMonitorApp:
     def _factor_result_sort_value(self, r, col):
         if col in ("rank", "price", "pct", "score", "coverage"):
             return r.get(col)
+        if col == "ma":
+            return len(r.get("ma_above") or [])
+        if col == "vol2":
+            return r.get("vol_prev2")
         if col == "advice":
             return {"强候选": 5, "候选": 4, "谨慎候选": 3,
                     "观察": 2, "回避": 1, "数据不足": 0}.get(r.get("advice"), 0)
@@ -4543,6 +4720,39 @@ class StockMonitorApp:
         rows = self.factor_rows
         if self.factor_buy_only_var.get():
             rows = [r for r in rows if r.get("advice") in ("强候选", "候选")]
+        vol_filter = getattr(self, "factor_vol", "全部") or "全部"
+        if vol_filter != "全部":
+            def vol_ok(r):
+                v = r.get("vol_prev2")
+                if v is None:
+                    return False
+                if vol_filter == "≈1倍(0.8~1.2)":
+                    return 0.8 <= v <= 1.2
+                if vol_filter == "0.5~1.5倍":
+                    return 0.5 <= v <= 1.5
+                if vol_filter.startswith("放量≥"):
+                    try:
+                        th = float(vol_filter.replace("放量≥", "").replace("倍", ""))
+                    except ValueError:
+                        return True
+                    return v >= th
+                if vol_filter == "缩量≤0.8倍":
+                    return v <= 0.8
+                return True
+            rows = [r for r in rows if vol_ok(r)]
+        ma_filter = getattr(self, "factor_ma", "全部") or "全部"
+        if ma_filter != "全部":
+            def ma_ok(r):
+                dev = r.get("ma_dev") or {}
+                try:
+                    period = int(ma_filter.replace("站上MA", "").replace("跌破MA", ""))
+                except ValueError:
+                    return True
+                val = dev.get(period)
+                if val is None:
+                    return False
+                return val >= 0 if ma_filter.startswith("站上MA") else val < 0
+            rows = [r for r in rows if ma_ok(r)]
         cat_keys = (("mom", "momentum"), ("trend", "trend"), ("vol", "volatility"),
                     ("liq", "liquidity"), ("pattern", "pattern"), ("market", "market"))
 
@@ -4575,6 +4785,8 @@ class StockMonitorApp:
                 pf(r.get("price")),
                 fmt_pct(pct),
                 "--" if score is None else f"{score:.1f}",
+                r.get("ma_status") or "—",
+                "--" if r.get("vol_prev2") is None else f"{r['vol_prev2']:.2f}x",
                 adv_short.get(advice, advice),
                 r.get("evidence") or "—",
             ) + tuple(cat_text(r, k) for _c, k in cat_keys) + (

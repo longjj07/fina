@@ -1159,13 +1159,15 @@ def _index_maps(index_bars):
 
 
 class Panel:
-    __slots__ = ("dates", "symbols", "values", "forward", "ranks", "fwd_rank")
+    __slots__ = ("dates", "symbols", "values", "forward", "volumes",
+                 "ranks", "fwd_rank")
 
-    def __init__(self, dates, symbols, values, forward):
+    def __init__(self, dates, symbols, values, forward, volumes):
         self.dates = dates
         self.symbols = symbols
         self.values = values
         self.forward = forward
+        self.volumes = volumes
         self.ranks = None
         self.fwd_rank = None
 
@@ -1185,6 +1187,7 @@ def build_panel(bars_by_symbol, index_bars, lookback=250, horizon=1,
     D = len(dates)
     values = {k: array("d", [NAN]) * (D * S) for k in FACTOR_KEYS}
     forward = array("d", [NAN]) * (D * S)
+    volumes = array("d", [NAN]) * (D * S)
 
     for si, sym in enumerate(symbols):
         _check(cancel_event)
@@ -1197,13 +1200,16 @@ def build_panel(bars_by_symbol, index_bars, lookback=250, horizon=1,
             if row:
                 for key, val in row.items():
                     values[key][off] = val
+            bar = by_date.get(date)
+            if bar is not None and bar[5] is not None:
+                volumes[off] = bar[5]
             fwd = _forward_return_dates(by_date, dates, di, horizon,
                                         entry_lag, return_mode)
             if fwd is not None:
                 forward[off] = fwd
         if (si + 1) % 20 == 0 or si + 1 == S:
             _emit(progress_cb, "panel", si + 1, S, f"计算因子 {si + 1}/{S}")
-    return Panel(dates, symbols, values, forward)
+    return Panel(dates, symbols, values, forward, volumes)
 
 
 def build_rank_panel(panel, progress_cb=None, cancel_event=None):
@@ -1264,6 +1270,93 @@ def compute_ic(panel, factor_keys=None, date_indices=None, min_names=20, horizon
                 stats[key]["pairs"] += n
                 stats[key]["by_date"][di] = n
     return stats, used
+
+
+def analyze_volume(panel, horizon=1, min_n=200):
+    """回测 当日量/前2日量 对次日收益的区分度: 分桶 + 阈值扫描 + 日度RankIC。"""
+    S = len(panel.symbols)
+    D = len(panel.dates)
+    date_indices = list(range(D))
+    if horizon > 1:
+        date_indices = date_indices[::horizon]
+    by_date = []
+    all_pairs = []
+    for di in date_indices:
+        if di < 2:
+            continue
+        off, off2 = di * S, (di - 2) * S
+        rows = []
+        for si in range(S):
+            v0 = panel.volumes[off + si]
+            v2 = panel.volumes[off2 + si]
+            fwd = panel.forward[off + si]
+            if (math.isfinite(v0) and math.isfinite(v2) and v2 > 0
+                    and math.isfinite(fwd)):
+                rows.append((v0 / v2, fwd))
+        if len(rows) >= 20:
+            by_date.append((di, rows))
+            all_pairs.extend(rows)
+    if len(all_pairs) < min_n:
+        return {"n_dates": 0, "n_pairs": len(all_pairs), "mean_ic": None,
+                "icir": None, "t": None, "baseline": None, "hit": None,
+                "buckets": [], "thresholds": [], "best": None}
+    ics = []
+    for _di, rows in by_date:
+        ic = _spearman([r for r, _f in rows], [f for _r, f in rows])
+        if ic is not None:
+            ics.append(ic)
+    mean_ic = _mean(ics)
+    std_ic = _std(ics)
+    icir = mean_ic / std_ic if (mean_ic is not None and std_ic and std_ic > 0) else None
+    t_ic = (mean_ic / (std_ic / math.sqrt(len(ics)))
+            if (mean_ic is not None and std_ic and std_ic > 0 and ics) else None)
+    rets = [f for _r, f in all_pairs]
+    baseline = _mean(rets)
+    base_hit = sum(1 for x in rets if x > 0) / float(len(rets))
+    buckets = [(0.0, 0.5), (0.5, 0.8), (0.8, 1.0), (1.0, 1.2),
+               (1.2, 1.5), (1.5, 2.0), (2.0, 3.0), (3.0, float("inf"))]
+    bucket_rows = []
+    for lo, hi in buckets:
+        vals = [f for r, f in all_pairs if lo <= r < hi]
+        if not vals:
+            bucket_rows.append({"range": f"{lo:g}~{hi:g}" if hi != float("inf") else f"≥{lo:g}",
+                                "n": 0, "mean": None, "hit": None,
+                                "excess": None, "t": None})
+            continue
+        m = _mean(vals)
+        sd = _std(vals)
+        bucket_rows.append({
+            "range": f"{lo:g}~{hi:g}" if hi != float("inf") else f"≥{lo:g}",
+            "n": len(vals), "mean": m,
+            "hit": sum(1 for x in vals if x > 0) / len(vals),
+            "excess": (m - baseline) if (m is not None and baseline is not None) else None,
+            "t": (m / (sd / math.sqrt(len(vals)))
+                  if (m is not None and sd and sd > 0) else None),
+        })
+    thresholds = [1.0, 1.2, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0]
+    threshold_rows = []
+    for th in thresholds:
+        vals = [f for r, f in all_pairs if r >= th]
+        if not vals:
+            continue
+        m = _mean(vals)
+        sd = _std(vals)
+        threshold_rows.append({
+            "threshold": th, "n": len(vals), "mean": m,
+            "hit": sum(1 for x in vals if x > 0) / len(vals),
+            "excess": (m - baseline) if (m is not None and baseline is not None) else None,
+            "t": (m / (sd / math.sqrt(len(vals)))
+                  if (m is not None and sd and sd > 0) else None),
+        })
+    candidates = [x for x in threshold_rows
+                  if x["n"] >= min_n and x["excess"] is not None and x["excess"] > 0]
+    best = max(candidates, key=lambda x: x["t"] or 0) if candidates else None
+    return {
+        "n_dates": len(by_date), "n_pairs": len(all_pairs),
+        "mean_ic": mean_ic, "icir": icir, "t": t_ic,
+        "baseline": baseline, "hit": base_hit,
+        "buckets": bucket_rows, "thresholds": threshold_rows, "best": best,
+    }
 
 
 def _subset_ic_stats(stats, date_set):
@@ -1635,6 +1728,31 @@ def score_latest(panel, weights, universe_rows, threshold=None,
         top = []
         for c, key in contribs[:3]:
             top.append(f"{FACTOR_DEFS[key][0]}{'+' if c >= 0 else '-'}")
+        ma_dev = {}
+        for k in (5, 10, 20, 60):
+            v = panel.values.get(f"ma_dev_{k}")
+            if v is not None:
+                x = v[off + si]
+                if math.isfinite(x):
+                    ma_dev[k] = x
+        up = [str(k) for k in (5, 10, 20, 60)
+              if ma_dev.get(k) is not None and ma_dev[k] >= 0]
+        down = [str(k) for k in (5, 10, 20, 60)
+                if ma_dev.get(k) is not None and ma_dev[k] < 0]
+        parts = []
+        if up:
+            parts.append("上" + ",".join(up))
+        if down:
+            parts.append("下" + ",".join(down))
+        ma_status = " ".join(parts) if parts else "—"
+        ma_above = [k for k in (5, 10, 20, 60)
+                    if ma_dev.get(k) is not None and ma_dev[k] >= 0]
+        vol_prev2 = None
+        if di >= 2:
+            v0 = panel.volumes[off + si]
+            v2 = panel.volumes[(di - 2) * S + si]
+            if math.isfinite(v0) and math.isfinite(v2) and v2 > 0:
+                vol_prev2 = v0 / v2
         u = by_symbol.get(sym, {})
         pct = u.get("pct")
         if exclude_limit_up and pct is not None and pct >= _price_limit(sym) - 0.05:
@@ -1653,6 +1771,8 @@ def score_latest(panel, weights, universe_rows, threshold=None,
             "cat_scores": cat_scores,
             "top": " ".join(top) if top else "—",
             "coverage": cov / float(len(weights)),
+            "ma_dev": ma_dev, "ma_status": ma_status, "ma_above": ma_above,
+            "vol_prev2": vol_prev2,
             "vol20": vol20 if math.isfinite(vol20) else None,
             "asof": panel.dates[di],
             "industry": "…",
@@ -1796,6 +1916,7 @@ def run_factor_screen(limit=300, lookback=250, horizon=1, bars_n=320,
     if not ic_dates:
         raise RuntimeError("没有足够的有效前瞻收益, 无法计算 IC")
     all_stats = summarize_ic(stats, len(ic_dates), len(panel.symbols))
+    vol_analysis = analyze_volume(panel, horizon=horizon)
 
     wf = walk_forward(panel, stats, ic_dates, top_k=20, horizon=horizon,
                       exclude_limit=exclude_limit_up)
@@ -1891,6 +2012,7 @@ def run_factor_screen(limit=300, lookback=250, horizon=1, bars_n=320,
         "elapsed": time.time() - t0,
         "warnings": warnings,
         "status": "OK" if live_weights else "无因子通过统计筛选",
+        "volume_best": (vol_analysis.get("best") or {}).get("threshold"),
     }
     _emit(progress_cb, "done", 1, 1,
           f"完成: {len(stocks)} 只候选 · 入选因子 {meta['selected']} 个")
@@ -1899,6 +2021,7 @@ def run_factor_screen(limit=300, lookback=250, horizon=1, bars_n=320,
         "factor_stats": factor_rows,
         "walk_forward": wf,
         "weights": live_weights,
+        "volume_analysis": vol_analysis,
         "meta": meta,
     }
 
