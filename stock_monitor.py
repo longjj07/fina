@@ -1344,25 +1344,23 @@ def fetch_screen_universe(market="a", f_min=0.0, limit=800):
     if market == "us":
         if factor_engine is None:
             raise RuntimeError("factor_engine.py 不可用")
+        # 与因子选股共用 Yahoo 美股池/报价, 两边价格与涨跌幅一致
         rows = factor_engine.fetch_us_universe(limit)
-        quotes = fetch_tencent_batch(["us" + str(r.get("code") or "") for r in rows])
         for r in rows:
-            sym = r.get("symbol")
-            q = quotes.get(sym) or {}
-            price = q.get("price") if q.get("price") is not None else r.get("price")
-            volume = q.get("volume") if q.get("volume") is not None else r.get("volume")
             out.append({
-                "symbol": sym, "code": r.get("code"),
-                "name": r.get("name") or q.get("name") or r.get("code"),
-                "price": price,
-                "pct": q.get("pct") if q.get("pct") is not None else r.get("pct"),
-                "amount": (volume or 0) * (price or 0) or r.get("amount"),
-                "volume": volume,
+                "symbol": r.get("symbol"), "code": r.get("code"),
+                "name": r.get("name") or r.get("code"),
+                "price": r.get("price"),
+                "pct": r.get("pct"),
+                "amount": r.get("amount"),
+                "volume": r.get("volume"),
                 "turnover": None,
-                "high": q.get("high") if q.get("high") is not None else r.get("high"),
-                "low": q.get("low") if q.get("low") is not None else r.get("low"),
-                "open": q.get("open") if q.get("open") is not None else r.get("open"),
+                "high": r.get("high"),
+                "low": r.get("low"),
+                "open": r.get("open"),
                 "market_cap": r.get("market_cap"),
+                "pe": r.get("pe"), "pb": r.get("pb"),
+                "prev_close": r.get("prev_close"),
                 "industry": r.get("industry") or r.get("sector") or "—",
                 "market": "us",
             })
@@ -1438,10 +1436,10 @@ _KLINE_TEN_LOCK = threading.Lock()
 
 
 def _kline_today_ref(mkt):
-    """判定日K最后一根是否为「当日」bar 的参照日期。
-    美股交易日比北京日期晚约1天(收盘在北京凌晨), 以本地日期-36h 作参照。"""
+    """日K最后一根是否为「当日」bar 的参照日期。
+    美股交易日比北京日期晚约1天(收盘在北京凌晨), 用本地日期-1天作参照。"""
     if mkt == "us":
-        return time.strftime("%Y-%m-%d", time.localtime(time.time() - 36 * 3600))
+        return time.strftime("%Y-%m-%d", time.localtime(time.time() - 86400))
     if mkt == "cr":
         return time.strftime("%Y-%m-%d", time.gmtime())
     return time.strftime("%Y-%m-%d")
@@ -1475,9 +1473,13 @@ def _fetch_sina_daily_kline(symbol, n=12):
 def fetch_daily_kline(symbol, n=12):
     """日K(腾讯前复权, 失败回退新浪): 返回 list[dict(date,open,close,high,low,volume)]
     旧->新, 失败返回 []。A股/港股直接用 sh/sz/bj/hk 前缀代码;
-    美股需带交易所后缀(如 usAAPL.OQ); 加密用 crBTCUSDT。"""
+    美股优先 Yahoo(与因子选股同源), 再回退腾讯/Nasdaq; 加密用 crBTCUSDT。"""
     if symbol.startswith("cr"):
         return fetch_crypto_bars(symbol[2:], n)
+    if symbol.startswith("us"):
+        bars = _fetch_yahoo_daily(symbol, n)
+        if bars:
+            return bars
     global _KLINE_TENCENT_OFF_UNTIL, _KLINE_TENCENT_FAILS
     if time.time() >= _KLINE_TENCENT_OFF_UNTIL:
         try:
@@ -1504,9 +1506,6 @@ def fetch_daily_kline(symbol, n=12):
     if bars:
         return bars
     if symbol.startswith("us"):
-        bars = _fetch_yahoo_daily(symbol, n)
-        if bars:
-            return bars
         tick = _us_ticker(symbol)
         if tick:
             bars = fetch_nasdaq_daily(tick, n)
@@ -1515,11 +1514,14 @@ def fetch_daily_kline(symbol, n=12):
     return []
 
 
-def derive_prev_metrics(bars, today_ref):
+def derive_prev_metrics(bars, today_ref, us=False):
     """从日K(旧->新)提取「昨日」截面指标(当日未定型 bar 不参与):
     p=昨日涨幅%  s=截至昨日连涨天数  vr=昨日量/前5日均量。数据不足返回 None。"""
     hist = [b for b in bars if b.get("close")]
-    if hist and hist[-1]["date"][:10] == today_ref:
+    if us:
+        # Yahoo 美股日线包含盘中未收盘 bar: 只保留 <= 参照日 的已完成交易日
+        hist = [b for b in hist if b["date"][:10] <= today_ref]
+    elif hist and hist[-1]["date"][:10] == today_ref:
         hist = hist[:-1]                      # 剔除当日(盘中未定型)bar
     if len(hist) < 2:
         return None
@@ -1548,7 +1550,8 @@ def fetch_prev_metrics(symbol):
     fail = _KLINE_FAIL_TS.get(symbol)
     if fail and time.time() - fail < _KLINE_FAIL_TTL:
         return None
-    m = derive_prev_metrics(fetch_daily_kline(symbol), _kline_today_ref(symbol[:2]))
+    m = derive_prev_metrics(fetch_daily_kline(symbol), _kline_today_ref(symbol[:2]),
+                            us=symbol.startswith("us"))
     if m is None:
         _KLINE_FAIL_TS[symbol] = time.time()
         return None
@@ -3268,9 +3271,10 @@ class StockMonitorApp:
                     if hs_min and hs < hs_min:
                         continue
                     cands.append(r)
-                # 第二段: 腾讯单只补齐量比(带 TTL 缓存)
-                self._screen_queue.put(("status", f"正在批量补齐量比... ({len(cands)} 只)"))
+                # 第二段: A股/ETF 补齐量比/换手(带 TTL 缓存)
                 if market in ("a", "etf") and cands:
+                    self._screen_queue.put(("status",
+                                            f"正在批量补齐量比... ({len(cands)} 只)"))
                     em_items = [(r.get("symbol"), em_quote_candidates(r.get("symbol")))
                                 for r in cands]
                     em_quotes = fetch_em_quotes(em_items)
@@ -4564,6 +4568,9 @@ class StockMonitorApp:
             mapping = {}
 
             def one(r):
+                ind = r.get("industry")
+                if ind not in (None, "", "…", "—"):
+                    return r.get("symbol"), ind
                 try:
                     return r.get("symbol"), fetch_industry(r.get("symbol"))
                 except Exception:

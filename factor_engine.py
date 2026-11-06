@@ -49,6 +49,16 @@ BINANCE_KLINES_URL = ("https://api.binance.com/api/v3/klines?"
 OKX_CANDLES_URL = "https://www.okx.com/api/v5/market/candles?instId={inst}&bar=1D&limit={n}"
 NASDAQ_SCREENER_URL = ("https://api.nasdaq.com/api/screener/stocks?"
                        "tableonly=true&limit=25&offset=0&download=true")
+YAHOO_SCREENER_FIELDS = ",".join((
+    "symbol", "longName", "shortName", "quoteType", "sector", "industry",
+    "regularMarketPrice", "regularMarketChangePercent", "regularMarketChange",
+    "regularMarketVolume", "regularMarketOpen", "regularMarketDayHigh",
+    "regularMarketDayLow", "regularMarketPreviousClose", "regularMarketTime",
+    "marketCap", "trailingPE", "priceToBook", "fullExchangeName",
+))
+YAHOO_SCREENER_URL = ("https://query1.finance.yahoo.com/v1/finance/screener/"
+                      "predefined/saved?scrIds=most_actives"
+                      "&count={count}&start={start}&fields=" + YAHOO_SCREENER_FIELDS)
 NASDAQ_HIST_URL = ("https://api.nasdaq.com/api/quote/{sym}/historical?"
                    "assetclass=stocks&fromdate={fromdate}&limit={n}")
 YAHOO_DAILY_URL = ("https://query1.finance.yahoo.com/v8/finance/chart/"
@@ -513,8 +523,18 @@ def _us_money(v):
         return None
 
 
-def fetch_us_universe(limit=150):
-    """Nasdaq screener 全美股列表, 按市值排序。"""
+def _yahoo_screener_rows(start, count=250):
+    hdr = {"User-Agent": UA["User-Agent"],
+           "Accept": "application/json, text/plain, */*"}
+    url = YAHOO_SCREENER_URL.format(count=count, start=start)
+    raw = _http(url, hdr, timeout=20)
+    data = json.loads(raw.decode("utf-8", "replace"))
+    res = (data.get("finance") or {}).get("result") or []
+    return (res[0].get("quotes") or []) if res else []
+
+
+def _fetch_us_universe_nasdaq(limit=150):
+    """Yahoo 不可用时的 Nasdaq screener 回退。"""
     hdr = {"User-Agent": UA["User-Agent"], "Referer": "https://www.nasdaq.com/",
            "Accept": "application/json, text/plain, */*"}
     raw = _http(NASDAQ_SCREENER_URL, hdr, timeout=20)
@@ -537,6 +557,52 @@ def fetch_us_universe(limit=150):
             "industry": r.get("industry"),
             "turnover": None, "market": "us",
         })
+    out.sort(key=lambda x: x["amount"], reverse=True)
+    return out[:limit]
+
+
+def fetch_us_universe(limit=150):
+    """Yahoo 预置筛选(most_actives)美股列表, 按成交额排序。
+
+    报价字段与因子日K同源(Yahoo), 选股器与因子选股因此显示一致的价格/涨跌幅。
+    """
+    out = []
+    seen = set()
+    start = 0
+    while len(out) < limit and start < 1000:
+        page = _yahoo_screener_rows(start, 250)
+        if not page:
+            break
+        for r in page:
+            sym = str(r.get("symbol") or "").strip().upper()
+            price = _to_float(r.get("regularMarketPrice"))
+            if not sym or price is None or price <= 0 or sym in seen:
+                continue
+            seen.add(sym)
+            vol = _to_float(r.get("regularMarketVolume"), 0) or 0
+            out.append({
+                "symbol": "us" + sym, "code": sym,
+                "name": str(r.get("longName") or r.get("shortName") or sym),
+                "price": price,
+                "pct": _to_float(r.get("regularMarketChangePercent")),
+                "amount": vol * price,
+                "volume": vol,
+                "high": _to_float(r.get("regularMarketDayHigh")),
+                "low": _to_float(r.get("regularMarketDayLow")),
+                "open": _to_float(r.get("regularMarketOpen")),
+                "prev_close": _to_float(r.get("regularMarketPreviousClose")),
+                "market_cap": _to_float(r.get("marketCap"), 0) or 0,
+                "pe": _to_float(r.get("trailingPE")),
+                "pb": _to_float(r.get("priceToBook")),
+                "sector": r.get("sector"),
+                "industry": r.get("industry"),
+                "turnover": None, "market": "us",
+            })
+        if len(page) < 250:
+            break
+        start += 250
+    if not out:
+        return _fetch_us_universe_nasdaq(limit)
     out.sort(key=lambda x: x["amount"], reverse=True)
     return out[:limit]
 
@@ -1775,7 +1841,7 @@ def score_latest(panel, weights, universe_rows, threshold=None,
             "vol_prev2": vol_prev2,
             "vol20": vol20 if math.isfinite(vol20) else None,
             "asof": panel.dates[di],
-            "industry": "…",
+            "industry": u.get("industry") or u.get("sector") or "…",
         })
     rows.sort(key=lambda r: r["score"], reverse=True)
     for i, r in enumerate(rows):

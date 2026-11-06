@@ -21,7 +21,7 @@
 ### 🔍 选股器（A股 / 美股 / ETF）
 - **市场选择**：A股 / 美股 / ETF，筛选条件随市场自动切换
 - A股：**涨幅区间**、**量比下限**、**换手率下限**
-- 美股：**涨幅区间**、**成交额下限（百万美元）**、**市值下限（亿美元）**
+- 美股：**涨幅区间**、**成交额下限（百万美元）**、**市值下限（亿美元）**（Yahoo 美股池，与因子选股同源）
 - ETF：**涨幅区间**、**成交额下限（亿元）**、**换手率下限**
 - **当日 vs 昨日对比**（量化筛股）：
   - **昨日涨幅区间**（如昨日涨 1%～4%，找「昨日温和放量、今日加速」的启动形态）
@@ -225,7 +225,7 @@ python stock_monitor.py
 |---|---|---|
 | 个股池 | 新浪 A股列表 `node=hs_a` | 今日成交额前 N，默认排除 ST |
 | ETF 池 | 新浪 ETF 列表 `node=etf_hq_fund` | 剔除货币/短融/债类等现金型 ETF |
-| 美股池 | Nasdaq screener | 全美股按成交额/市值排序，取前 N |
+| 美股池 | Yahoo 预置筛选 `most_actives` | 按成交额排序取前 N；含行业/市值/PE；与选股器共用同一接口 |
 | 加密池 | Binance `ticker/24hr` | USDT 现货按 24h 成交额排序，过滤稳定币/杠杆代币 |
 | 日K | 腾讯 → 新浪 → Yahoo（港美股） | 腾讯前复权；新浪不回权 |
 | 美股日K | Yahoo chart（主）→ Nasdaq historical（回退） | Yahoo 日线，约 2 年历史 |
@@ -411,14 +411,14 @@ pip install pywencai        # 会带装 pandas/requests 等
 | 自选股 / 指数报价 | 新浪 `hq.sinajs.cn` 批量（主）+ 腾讯 `qt.gtimg.cn` 回退 | 一次请求批量取 A股/港股/ETF/指数；美股走腾讯 |
 | 加密货币报价 | Binance `ticker/24hr`（主）+ OKX tickers 回退 | USDT 现货，7x24 实时 |
 | 选股器 A股列表 | 新浪 `Market_Center.getHQNodeData`（node=hs_a） | 涨跌幅/换手率/成交额，按涨跌幅排序分页 |
-| 选股器 美股列表 | Nasdaq screener + 腾讯美股批量报价 | 市值/行业/成交额 + 当前涨跌幅 |
+| 选股器 美股列表 | Yahoo 预置筛选 `most_actives` | 报价/涨跌幅/市值/行业；与因子选股共用同一接口 |
 | 选股器 ETF列表 | 新浪 `node=etf_hq_fund` | 成交额/换手率，过滤货币/债类 |
 | 量比/换手补齐 | 东方财富 `push2.eastmoney.com/api/qt/ulist.np/get` 批量（主）+ 腾讯单只回退 | A股/港股/美股批量快照，失败自动熔断 |
 | 历史日K（昨日涨幅/连涨/昨日量能） | 腾讯 fqkline → 新浪 → Yahoo（港美股） | 腾讯前复权；新浪不回权；Yahoo 用于港美股兜底 |
 | 分笔成交 | 腾讯逐笔（A股）/ 东财逐笔（港美股）/ Binance trades（加密）/ Yahoo 1分钟分时兜底 | 5 秒刷新，显示时间/价格/量/买卖方向 |
 | 综合评估基本面 | 腾讯长格式 + Nasdaq summary + SEC companyconcept | 美股补行业、目标价、营收/净利率/ROE/EPS；A股/ETF用腾讯字段 |
 | 美股新闻 | Yahoo Finance search news + 东财个股资讯 | 合并去重，关键词标利好/利空 |
-| 美股日K | Yahoo chart → Nasdaq historical | 用于技术面/昨日涨幅/评价 |
+| 美股日K | Yahoo chart（主）→ Nasdaq historical（回退） | 用于技术面/昨日涨幅/评价；选股器与因子选股共用 |
 | 24h消息面（个股资讯） | 东方财富 `np-listapi.eastmoney.com` | 三市场个股资讯，过滤近24h，关键词标注利好/利空 |
 | 7x24快讯 | 新浪 `zhibo.sina.com.cn` | 全球财经直播流（zhibo_id=152） |
 | 问财选股（可选） | 同花顺 `www.iwencai.com`（经 pywencai） | 自然语言筛选；需 pywencai + Node.js + 登录cookie |
@@ -437,7 +437,7 @@ pip install pywencai        # 会带装 pandas/requests 等
 当前**免密钥**已接入：
 
 - **Nasdaq**：美股列表、summary（行业/市值/52周/目标价/平均量）、historical 日K
-- **Yahoo Finance**：日K、新闻搜索
+- **Yahoo Finance**：美股池/报价（screener `most_actives`）、日K、新闻搜索；选股器与因子选股共用
 - **SEC EDGAR**：营收、净利润、净利率、ROE、EPS（companyconcept）
 - **Tencent**：美股实时快照（约15分钟延时）与 PE 等基础字段
 
