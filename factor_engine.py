@@ -28,6 +28,7 @@ import json
 import math
 import os
 import random
+import socket
 import sys
 import threading
 import time
@@ -49,20 +50,36 @@ BINANCE_KLINES_URL = ("https://api.binance.com/api/v3/klines?"
 OKX_CANDLES_URL = "https://www.okx.com/api/v5/market/candles?instId={inst}&bar=1D&limit={n}"
 NASDAQ_SCREENER_URL = ("https://api.nasdaq.com/api/screener/stocks?"
                        "tableonly=true&limit=25&offset=0&download=true")
+# Yahoo 接口地址保留为可配置: 设置环境变量 FINA_YAHOO_BASE 可换成镜像/代理地址
+YAHOO_BASE = os.environ.get("FINA_YAHOO_BASE",
+                            "https://query1.finance.yahoo.com").rstrip("/")
+# 美股数据源优先级: yahoo=Yahoo(默认) / em=东方财富(直连)
+US_SOURCE = os.environ.get("FINA_US_SOURCE", "yahoo").strip().lower()
 YAHOO_SCREENER_FIELDS = ",".join((
     "symbol", "longName", "shortName", "quoteType", "sector", "industry",
     "regularMarketPrice", "regularMarketChangePercent", "regularMarketChange",
     "regularMarketVolume", "regularMarketOpen", "regularMarketDayHigh",
     "regularMarketDayLow", "regularMarketPreviousClose", "regularMarketTime",
-    "marketCap", "trailingPE", "priceToBook", "fullExchangeName",
+    "marketCap", "trailingPE", "priceToBook", "sharesOutstanding",
+    "averageDailyVolume10Day", "fullExchangeName",
 ))
-YAHOO_SCREENER_URL = ("https://query1.finance.yahoo.com/v1/finance/screener/"
-                      "predefined/saved?scrIds=most_actives"
-                      "&count={count}&start={start}&fields=" + YAHOO_SCREENER_FIELDS)
+YAHOO_SCREENER_URL = (YAHOO_BASE + "/v1/finance/screener/predefined/saved"
+                      "?scrIds=most_actives&count={count}&start={start}&fields="
+                      + YAHOO_SCREENER_FIELDS)
 NASDAQ_HIST_URL = ("https://api.nasdaq.com/api/quote/{sym}/historical?"
                    "assetclass=stocks&fromdate={fromdate}&limit={n}")
-YAHOO_DAILY_URL = ("https://query1.finance.yahoo.com/v8/finance/chart/"
-                   "{sym}?interval=1d&range=2y")
+YAHOO_DAILY_URL = (YAHOO_BASE + "/v8/finance/chart/"
+                   "{sym}?interval=1d&range={rng}")
+# 东方财富美股(国内直连): 列表 / 日K / 指数
+EM_US_LIST_URL = ("https://push2.eastmoney.com/api/qt/clist/get?"
+                  "pn={page}&pz=100&po=1&np=1&fltt=2&invt=2&fid=f6"
+                  "&fs=m:105,m:106,m:107"
+                  "&fields=f2,f3,f5,f6,f8,f9,f10,f12,f13,f14,f15,f16,f17,"
+                  "f18,f20,f23,f100")
+EM_KLINE_URL = ("https://push2his.eastmoney.com/api/qt/stock/kline/get?"
+                "secid={secid}&klt=101&fqt=1&lmt={n}&end=20500101"
+                "&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56")
+EM_US_INDEX_SECIDS = ("100.SPX", "100.DJIA", "100.NDX")
 US_FALLBACK = [
     "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "AVGO", "AMD",
     "NFLX", "JPM", "V", "MA", "COST", "HD", "UNH", "XOM", "JNJ", "WMT", "PG",
@@ -152,8 +169,48 @@ FACTOR_KEYS = tuple(FACTOR_DEFS)
 # 基础工具
 # ---------------------------------------------------------------------------
 
+_PROXY_CHECK = {"ts": 0.0, "alive": None}
+_DIRECT_OPENER = None
+
+
+def _proxy_usable():
+    """系统代理存在但进程未运行时返回 False, 改用直连。"""
+    proxies = urllib.request.getproxies()
+    p = proxies.get("https") or proxies.get("http")
+    if not p:
+        return True
+    now = time.time()
+    if _PROXY_CHECK["alive"] is not None and now - _PROXY_CHECK["ts"] < 30:
+        return _PROXY_CHECK["alive"]
+    alive = False
+    try:
+        hostport = p.split("://", 1)[-1].rstrip("/")
+        host, _, port = hostport.partition(":")
+        with socket.create_connection((host, int(port or 80)), timeout=0.8):
+            alive = True
+    except Exception:
+        alive = False
+    _PROXY_CHECK.update(ts=now, alive=alive)
+    return alive
+
+
+_DOMESTIC_HOSTS = ("eastmoney.com", "sinajs.cn", "sina.com.cn",
+                   "gtimg.cn", "qq.com")
+
+
+def _is_domestic(url):
+    host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    return any(host == h or host.endswith("." + h) for h in _DOMESTIC_HOSTS)
+
+
 def _http(url, headers, timeout=10):
+    global _DIRECT_OPENER
     req = urllib.request.Request(url, headers=headers)
+    if _is_domestic(url) or not _proxy_usable():
+        if _DIRECT_OPENER is None:
+            _DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with _DIRECT_OPENER.open(req, timeout=timeout) as resp:
+            return resp.read()
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read()
 
@@ -523,22 +580,177 @@ def _us_money(v):
         return None
 
 
+# 海外源熔断: Yahoo/Nasdaq 连续失败后暂停 10 分钟, 避免每次运行都等超时
+_SRC_LOCK = threading.Lock()
+_SRC_STATE = {"yahoo": [0, 0.0], "nasdaq": [0, 0.0]}
+_SRC_TTL = 600.0
+
+
+def _src_ok(name):
+    with _SRC_LOCK:
+        return time.time() >= _SRC_STATE[name][1]
+
+
+def _src_mark(name, ok):
+    with _SRC_LOCK:
+        fails, off = _SRC_STATE[name]
+        if ok:
+            _SRC_STATE[name] = [0, 0.0]
+        else:
+            fails += 1
+            _SRC_STATE[name] = [fails, time.time() + _SRC_TTL if fails >= 2 else off]
+
+
+# 美股 code -> 东财市场号(105=纳斯达克,106=纽交所,107=美交所)
+_EM_US_MARKET = {}
+
+
+def _fetch_us_universe_em(limit=150):
+    """东方财富美股列表(国内直连), 含价格/涨跌幅/成交额/市值/PE/PB/行业。"""
+    out = []
+    seen = set()
+    page = 1
+    max_page = max(2, limit // 100 + 3)
+    while len(out) < limit and page <= max_page:
+        try:
+            raw = _http(EM_US_LIST_URL.format(page=page), UA, timeout=12)
+            data = json.loads(raw.decode("utf-8", "replace"))
+        except Exception:
+            break
+        rows = (data.get("data") or {}).get("diff") or []
+        if not rows:
+            break
+        for r in rows:
+            raw_code = str(r.get("f12") or "").strip().upper()
+            price = _to_float(r.get("f2"))
+            vol = _to_float(r.get("f5"), 0) or 0
+            if not raw_code or price is None or price <= 0 or vol <= 0:
+                continue
+            code = raw_code.replace("_", ".")
+            if code in seen:
+                continue
+            seen.add(code)
+            mkt = int(r.get("f13") or 0) or None
+            if mkt:
+                _EM_US_MARKET[code] = mkt
+            amount = _to_float(r.get("f6"))
+            out.append({
+                "symbol": "us" + code, "code": code,
+                "em_code": raw_code,
+                "em_secid": f"{mkt}.{raw_code}" if mkt else None,
+                "name": str(r.get("f14") or code),
+                "price": price,
+                "pct": _to_float(r.get("f3")),
+                "amount": amount if amount is not None else vol * price,
+                "volume": vol,
+                "high": _to_float(r.get("f15")),
+                "low": _to_float(r.get("f16")),
+                "open": _to_float(r.get("f17")),
+                "prev_close": _to_float(r.get("f18")),
+                "market_cap": _to_float(r.get("f20"), 0) or 0,
+                "pe": _to_float(r.get("f9")),
+                "pb": _to_float(r.get("f23")),
+                "lb": _to_float(r.get("f10")),
+                "hs": _to_float(r.get("f8")),
+                "industry": r.get("f100") if r.get("f100") not in (None, "-") else None,
+                "turnover": None, "market": "us",
+            })
+        if len(rows) < 100:
+            break
+        page += 1
+    out.sort(key=lambda x: x["amount"], reverse=True)
+    return out[:limit]
+
+
+def _fetch_em_us_bars(code, n=320, market_id=None, em_code=None):
+    """东方财富美股日K(前复权), 代码 BRK.B -> BRK_B。"""
+    raw_code = em_code or str(code).replace(".", "_").upper()
+    ids = []
+    if market_id:
+        ids.append(int(market_id))
+    for m in (105, 106, 107):
+        if m not in ids:
+            ids.append(m)
+    for m in ids:
+        try:
+            raw = _http(EM_KLINE_URL.format(secid=f"{m}.{raw_code}",
+                                            n=max(10, int(n))), UA, timeout=12)
+            data = json.loads(raw.decode("utf-8", "replace")).get("data") or {}
+            rows = []
+            for line in data.get("klines") or []:
+                p = str(line).split(",")
+                if len(p) < 6:
+                    continue
+                try:
+                    date = p[0][:10]
+                    o, c, h, l, v = (float(p[1]), float(p[2]), float(p[3]),
+                                     float(p[4]), float(p[5]))
+                except (TypeError, ValueError):
+                    continue
+                if c <= 0:
+                    continue
+                rows.append((date, o, c, h, l, v))
+            if rows:
+                _EM_US_MARKET[code] = m
+                return rows[-n:]
+        except Exception:
+            continue
+    return []
+
+
+def _fetch_em_index_bars(n=320):
+    for secid in EM_US_INDEX_SECIDS:
+        try:
+            raw = _http(EM_KLINE_URL.format(secid=secid, n=max(10, int(n))),
+                        UA, timeout=12)
+            data = json.loads(raw.decode("utf-8", "replace")).get("data") or {}
+            rows = []
+            for line in data.get("klines") or []:
+                p = str(line).split(",")
+                if len(p) < 6:
+                    continue
+                try:
+                    rows.append((p[0][:10], float(p[1]), float(p[2]),
+                                 float(p[3]), float(p[4]), float(p[5])))
+                except (TypeError, ValueError):
+                    continue
+            if rows:
+                return rows[-n:]
+        except Exception:
+            continue
+    return []
+
+
 def _yahoo_screener_rows(start, count=250):
+    if not _src_ok("yahoo"):
+        return []
     hdr = {"User-Agent": UA["User-Agent"],
            "Accept": "application/json, text/plain, */*"}
     url = YAHOO_SCREENER_URL.format(count=count, start=start)
-    raw = _http(url, hdr, timeout=20)
-    data = json.loads(raw.decode("utf-8", "replace"))
-    res = (data.get("finance") or {}).get("result") or []
-    return (res[0].get("quotes") or []) if res else []
+    try:
+        raw = _http(url, hdr, timeout=8)
+        data = json.loads(raw.decode("utf-8", "replace"))
+        res = (data.get("finance") or {}).get("result") or []
+        _src_mark("yahoo", True)
+        return (res[0].get("quotes") or []) if res else []
+    except Exception:
+        _src_mark("yahoo", False)
+        return []
 
 
 def _fetch_us_universe_nasdaq(limit=150):
-    """Yahoo 不可用时的 Nasdaq screener 回退。"""
+    """东财/Yahoo 都不可用时的 Nasdaq screener 兜底(海外源, 当前可能不可达)。"""
+    if not _src_ok("nasdaq"):
+        return []
     hdr = {"User-Agent": UA["User-Agent"], "Referer": "https://www.nasdaq.com/",
            "Accept": "application/json, text/plain, */*"}
-    raw = _http(NASDAQ_SCREENER_URL, hdr, timeout=20)
-    data = json.loads(raw.decode("utf-8", "replace"))
+    try:
+        raw = _http(NASDAQ_SCREENER_URL, hdr, timeout=12)
+        data = json.loads(raw.decode("utf-8", "replace"))
+        _src_mark("nasdaq", True)
+    except Exception:
+        _src_mark("nasdaq", False)
+        return []
     rows = (((data.get("data") or {}).get("rows")) or [])
     out = []
     for r in rows:
@@ -561,11 +773,8 @@ def _fetch_us_universe_nasdaq(limit=150):
     return out[:limit]
 
 
-def fetch_us_universe(limit=150):
-    """Yahoo 预置筛选(most_actives)美股列表, 按成交额排序。
-
-    报价字段与因子日K同源(Yahoo), 选股器与因子选股因此显示一致的价格/涨跌幅。
-    """
+def _fetch_us_universe_yahoo(limit=150):
+    """Yahoo 预置筛选(most_actives)美股列表(预留海外源, 需可访问 Yahoo)。"""
     out = []
     seen = set()
     start = 0
@@ -580,6 +789,10 @@ def fetch_us_universe(limit=150):
                 continue
             seen.add(sym)
             vol = _to_float(r.get("regularMarketVolume"), 0) or 0
+            adv10 = _to_float(r.get("averageDailyVolume10Day"))
+            shares = _to_float(r.get("sharesOutstanding"))
+            lb = round(vol / adv10, 2) if adv10 and adv10 > 0 else None
+            hs = round(vol / shares * 100.0, 3) if shares and shares > 0 else None
             out.append({
                 "symbol": "us" + sym, "code": sym,
                 "name": str(r.get("longName") or r.get("shortName") or sym),
@@ -594,6 +807,8 @@ def fetch_us_universe(limit=150):
                 "market_cap": _to_float(r.get("marketCap"), 0) or 0,
                 "pe": _to_float(r.get("trailingPE")),
                 "pb": _to_float(r.get("priceToBook")),
+                "lb": lb, "hs": hs,
+                "shares": shares,
                 "sector": r.get("sector"),
                 "industry": r.get("industry"),
                 "turnover": None, "market": "us",
@@ -601,17 +816,40 @@ def fetch_us_universe(limit=150):
         if len(page) < 250:
             break
         start += 250
-    if not out:
-        return _fetch_us_universe_nasdaq(limit)
     out.sort(key=lambda x: x["amount"], reverse=True)
     return out[:limit]
 
 
+def fetch_us_universe(limit=150):
+    """美股池: 默认 Yahoo; Yahoo 不可达时自动回退东方财富(国内直连)。
+
+    FINA_US_SOURCE=em 可强制东财优先; Yahoo 地址可用 FINA_YAHOO_BASE 替换。
+    """
+    if US_SOURCE == "em":
+        out = _fetch_us_universe_em(limit)
+        if out:
+            return out
+    out = _fetch_us_universe_yahoo(limit)
+    if out:
+        return out
+    out = _fetch_us_universe_em(limit)
+    if out:
+        return out
+    return _fetch_us_universe_nasdaq(limit)
+
+
 def _yahoo_daily_bars(sym, n=320):
+    if not _src_ok("yahoo"):
+        return []
     url_sym = urllib.parse.quote(str(sym).replace(".", "-"), safe="")
-    raw = _http(YAHOO_DAILY_URL.format(sym=url_sym), UA, timeout=10)
-    res = ((json.loads(raw.decode("utf-8", "replace")).get("chart") or {})
-           .get("result") or [])
+    rng = "6mo" if n <= 60 else "2y"
+    try:
+        raw = _http(YAHOO_DAILY_URL.format(sym=url_sym, rng=rng), UA, timeout=8)
+        res = ((json.loads(raw.decode("utf-8", "replace")).get("chart") or {})
+               .get("result") or [])
+    except Exception:
+        _src_mark("yahoo", False)
+        return []
     if not res:
         return []
     meta = res[0].get("meta") or {}
@@ -637,16 +875,25 @@ def _yahoo_daily_bars(sym, n=320):
         date = time.strftime("%Y-%m-%d", time.gmtime(float(t) + off))
         out.append((date, float(o), float(c), float(h), float(l), float(v or 0)))
     out.sort(key=lambda x: x[0])
+    if out:
+        _src_mark("yahoo", True)
     return out[-n:]
 
 
 def _nasdaq_daily_bars(sym, n=320):
+    if not _src_ok("nasdaq"):
+        return []
     fromdate = time.strftime("%Y-%m-%d", time.localtime(time.time() - max(60, n * 2) * 86400))
     hdr = {"User-Agent": UA["User-Agent"], "Referer": "https://www.nasdaq.com/",
            "Accept": "application/json, text/plain, */*"}
-    raw = _http(NASDAQ_HIST_URL.format(sym=sym, fromdate=fromdate, n=n), hdr, timeout=15)
-    rows = (((json.loads(raw.decode("utf-8", "replace")).get("data") or {})
-             .get("tradesTable") or {}).get("rows") or [])
+    try:
+        raw = _http(NASDAQ_HIST_URL.format(sym=sym, fromdate=fromdate, n=n),
+                    hdr, timeout=10)
+        data = json.loads(raw.decode("utf-8", "replace"))
+    except Exception:
+        _src_mark("nasdaq", False)
+        return []
+    rows = (((data.get("data") or {}).get("tradesTable") or {}).get("rows") or [])
     out = []
     for r in rows:
         try:
@@ -661,22 +908,35 @@ def _nasdaq_daily_bars(sym, n=320):
                     _us_money(r.get("high")) or c, _us_money(r.get("low")) or c,
                     _us_money(r.get("volume")) or 0))
     out.sort(key=lambda x: x[0])
+    if out:
+        _src_mark("nasdaq", True)
     return out[-n:]
 
 
 def _fetch_us_bars_src(sym, n=320):
+    """美股日K: 默认 Yahoo; 不可达时自动回退东财(国内直连)/Nasdaq。"""
+    ticker = str(sym)
+    if ticker.startswith("us") and len(ticker) > 2:
+        ticker = ticker[2:]
+    if US_SOURCE != "em":
+        bars = _yahoo_daily_bars(ticker, n)
+        if bars:
+            return bars, "yahoo"
+    bars = _fetch_em_us_bars(ticker, n, _EM_US_MARKET.get(ticker.upper()))
+    if bars:
+        return bars, "eastmoney"
     try:
-        bars = _yahoo_daily_bars(sym, n)
+        bars = _yahoo_daily_bars(ticker, n)
         if bars:
             return bars, "yahoo"
     except Exception:
-        pass
+        _src_mark("yahoo", False)
     try:
-        bars = _nasdaq_daily_bars(sym, n)
+        bars = _nasdaq_daily_bars(ticker, n)
         if bars:
             return bars, "nasdaq"
     except Exception:
-        pass
+        _src_mark("nasdaq", False)
     return [], ""
 
 
@@ -685,6 +945,14 @@ def fetch_us_bars(sym, n=320):
 
 
 def fetch_us_index_bars(n=320):
+    if US_SOURCE != "em":
+        for sym in ("^GSPC", "SPY"):
+            bars = _yahoo_daily_bars(sym, n)
+            if bars:
+                return bars
+    bars = _fetch_em_index_bars(n)
+    if bars:
+        return bars
     for sym in ("^GSPC", "SPY"):
         bars = _yahoo_daily_bars(sym, n)
         if bars:
@@ -739,7 +1007,7 @@ def fetch_universe_bars(symbols, n=320, cache=None, workers=4,
     now = time.time()
     result = {}
     sources = {"tencent": 0, "sina": 0, "binance": 0, "okx": 0,
-               "yahoo": 0, "nasdaq": 0}
+               "eastmoney": 0, "yahoo": 0, "nasdaq": 0}
     hits = 0
     fails = 0
     lock = threading.Lock()
@@ -820,8 +1088,8 @@ def fetch_universe_bars(symbols, n=320, cache=None, workers=4,
                 msg = (f"日K {i + 1}/{total} · 缓存 {hits} · 币安 {sources['binance']}"
                        f" · 欧易 {sources['okx']} · 失败 {fails}")
             elif market == "us":
-                msg = (f"日K {i + 1}/{total} · 缓存 {hits} · Yahoo {sources['yahoo']}"
-                       f" · Nasdaq {sources['nasdaq']} · 失败 {fails}")
+                msg = (f"日K {i + 1}/{total} · 缓存 {hits} · 东财 {sources['eastmoney']}"
+                       f" · Yahoo {sources['yahoo']} · 失败 {fails}")
             else:
                 msg = (f"日K {i + 1}/{total} · 缓存 {hits} · 腾讯 {sources['tencent']}"
                        f" · 新浪 {sources['sina']} · 失败 {fails}")
@@ -849,6 +1117,20 @@ def _forward_return_dates(bars_by_date, dates, di, horizon, entry_lag=1,
     if entry is None or entry <= 0 or exit_price is None:
         return None
     return exit_price / entry - 1.0
+
+
+def _entry_gap(bars_by_date, dates, di, entry_lag=1):
+    """信号日收盘 -> 次日开盘的跳空幅度; 缺失返回 None。"""
+    if di + entry_lag >= len(dates):
+        return None
+    cur = bars_by_date.get(dates[di])
+    ent = bars_by_date.get(dates[di + entry_lag])
+    if cur is None or ent is None:
+        return None
+    c, o = cur[2], ent[1]
+    if not c or c <= 0 or o is None or o <= 0:
+        return None
+    return o / c - 1.0
 
 
 def _indicators(bars):
@@ -1225,15 +1507,16 @@ def _index_maps(index_bars):
 
 
 class Panel:
-    __slots__ = ("dates", "symbols", "values", "forward", "volumes",
+    __slots__ = ("dates", "symbols", "values", "forward", "volumes", "gaps",
                  "ranks", "fwd_rank")
 
-    def __init__(self, dates, symbols, values, forward, volumes):
+    def __init__(self, dates, symbols, values, forward, volumes, gaps=None):
         self.dates = dates
         self.symbols = symbols
         self.values = values
         self.forward = forward
         self.volumes = volumes
+        self.gaps = gaps
         self.ranks = None
         self.fwd_rank = None
 
@@ -1254,6 +1537,7 @@ def build_panel(bars_by_symbol, index_bars, lookback=250, horizon=1,
     values = {k: array("d", [NAN]) * (D * S) for k in FACTOR_KEYS}
     forward = array("d", [NAN]) * (D * S)
     volumes = array("d", [NAN]) * (D * S)
+    gaps = array("d", [NAN]) * (D * S)
 
     for si, sym in enumerate(symbols):
         _check(cancel_event)
@@ -1271,11 +1555,18 @@ def build_panel(bars_by_symbol, index_bars, lookback=250, horizon=1,
                 volumes[off] = bar[5]
             fwd = _forward_return_dates(by_date, dates, di, horizon,
                                         entry_lag, return_mode)
+            gap = _entry_gap(by_date, dates, di, entry_lag)
+            if gap is not None:
+                gaps[off] = gap
+            # A股/ETF 次日开盘即涨停时无法买入, 不计入前瞻收益/IC
+            if fwd is not None and gap is not None and sym.startswith(("sh", "sz", "bj")):
+                if gap >= _price_limit(sym) / 100.0 - 0.005:
+                    fwd = None
             if fwd is not None:
                 forward[off] = fwd
         if (si + 1) % 20 == 0 or si + 1 == S:
             _emit(progress_cb, "panel", si + 1, S, f"计算因子 {si + 1}/{S}")
-    return Panel(dates, symbols, values, forward, volumes)
+    return Panel(dates, symbols, values, forward, volumes, gaps)
 
 
 def build_rank_panel(panel, progress_cb=None, cancel_event=None):
@@ -1506,11 +1797,13 @@ def _rank_series_corr(panel, k1, k2, sample_dates, S):
 
 
 def select_weights(panel, stats, date_indices, min_coverage=0.5,
-                   min_abs_ic=0.01, min_t=1.5, min_consistency=0.55,
+                   min_abs_ic=0.01, min_t=None, min_consistency=0.55,
                    corr_cap=0.85, sign_map=None, cancel_event=None):
     S = len(panel.symbols)
     # 5 日周期 + 短回看时有效 IC 日期天然较少, 门槛随之放宽, 但不低于 8 天
     min_dates = min(20, max(8, len(date_indices) // 2))
+    # 42 个因子同时检验, 样本越长越应提高 t 门槛以控制假阳性
+    t_gate = min_t if min_t is not None else (2.0 if len(date_indices) >= 60 else 1.5)
     eligible = []
     reasons = {}
     for key, st in stats.items():
@@ -1525,10 +1818,14 @@ def select_weights(panel, stats, date_indices, min_coverage=0.5,
             why = "无有效IC"
         elif abs(ref_mean) < min_abs_ic:
             why = "|IC|过低"
-        elif st["t"] is None or abs(st["t"]) < min_t:
+        elif st["t"] is None or abs(st["t"]) < t_gate:
             why = "t值不显著"
         elif st["consistency"] is None or st["consistency"] < min_consistency:
             why = "方向不稳定"
+        elif (st.get("recent_mean_ic") is not None and ref_mean is not None
+              and abs(st["recent_mean_ic"]) >= 0.01
+              and (st["recent_mean_ic"] > 0) != (ref_mean > 0)):
+            why = "近期变号"
         elif sign_map is not None and key in sign_map and not sign_map[key]:
             why = "样本外变号"
         if why:
@@ -1549,16 +1846,22 @@ def select_weights(panel, stats, date_indices, min_coverage=0.5,
     for key, sign, strength in eligible:
         _check(cancel_event)
         conflict = None
+        corr_load = 0.0
         for k2, _s2, _st2 in kept:
             c = _rank_series_corr(panel, key, k2, sample_dates, S)
-            if c is not None and abs(c) > corr_cap:
-                conflict = (k2, c)
-                break
+            if c is not None:
+                if abs(c) > corr_cap:
+                    conflict = (k2, c)
+                    break
+                corr_load += abs(c)
         if conflict:
             reasons[key] = f"与{FACTOR_DEFS[conflict[0]][0]}高相关({conflict[1]:+.2f})"
             continue
-        kept.append((key, sign, strength))
-        meta[key] = {"sign": sign, "strength": strength}
+        # 与已选因子的平均相关性越高, 权重越低, 避免同类信息重复计价
+        adj = strength / math.sqrt(1.0 + corr_load)
+        kept.append((key, sign, adj))
+        meta[key] = {"sign": sign, "strength": strength,
+                     "adj_strength": adj, "corr_load": corr_load}
 
     total = sum(x[2] for x in kept)
     weights = {}
@@ -1588,6 +1891,24 @@ def _summarize_ic_values(ics, num_dates):
             "icir": icir, "t": t, "dates": num_dates}
 
 
+def _composite(ranks, weights, off, si, min_cov=None):
+    """加权分位合成, 并按可用因子总权重归一化, 避免缺失因子把分数拉向中位。"""
+    total = 0.0
+    abs_w = 0.0
+    cov = 0
+    for key, w in weights.items():
+        rk = ranks[key][off + si]
+        if math.isfinite(rk):
+            total += w * (rk - 0.5)
+            abs_w += abs(w)
+            cov += 1
+    if min_cov is not None and cov < min_cov:
+        return None, cov
+    if abs_w <= 0:
+        return None, cov
+    return total / abs_w, cov
+
+
 def _eval_weights(panel, date_indices, weights):
     S = len(panel.symbols)
     ranks = build_rank_panel(panel)
@@ -1600,21 +1921,18 @@ def _eval_weights(panel, date_indices, weights):
             y = panel.forward[off + si]
             if not math.isfinite(y):
                 continue
-            total = 0.0
-            cov = 0
-            for key, w in weights.items():
-                rk = ranks[key][off + si]
-                if math.isfinite(rk):
-                    total += w * (rk - 0.5)
-                    cov += 1
-            if cov >= min_cov:
-                scores.append(50.0 + 50.0 * total)
-                fwd.append(y)
+            comp, _cov = _composite(ranks, weights, off, si, min_cov=min_cov)
+            if comp is None:
+                continue
+            scores.append(comp)
+            fwd.append(y)
         if len(scores) >= 20:
             ic = _spearman(scores, fwd)
             if ic is not None:
                 ics.append(ic)
-    return _summarize_ic_values(ics, len(date_indices))
+    result = _summarize_ic_values(ics, len(date_indices))
+    result["ics"] = ics
+    return result
 
 
 def _simulate_topk(panel, weights, date_indices, top_k=20, horizon=1,
@@ -1642,15 +1960,10 @@ def _simulate_topk(panel, weights, date_indices, top_k=20, horizon=1,
                 r1 = ret1[off + si]
                 if math.isfinite(r1) and r1 >= _price_limit(sym) / 100.0 - 0.0005:
                     continue
-            total = 0.0
-            cov = 0
-            for key, w in weights.items():
-                rk = ranks[key][off + si]
-                if math.isfinite(rk):
-                    total += w * (rk - 0.5)
-                    cov += 1
-            if cov >= min_cov:
-                scored.append((total, y))
+            comp, cov = _composite(ranks, weights, off, si, min_cov=min_cov)
+            if comp is None:
+                continue
+            scored.append((comp, y))
         if len(scored) < top_k:
             continue
         scored.sort(key=lambda x: x[0], reverse=True)
@@ -1694,6 +2007,7 @@ def walk_forward(panel, stats, ic_dates, split=0.7, top_k=20, horizon=1,
                 "equal_oos": _summarize_ic_values([], 0),
                 "portfolio": _simulate_topk(panel, {}, [], top_k=top_k, horizon=horizon),
                 "train_dates": 0, "test_dates": 0,
+                "folds": [], "oos_folds": _summarize_ic_values([], 0),
                 "note": "有效IC日期不足，无法做样本外检验"}
     cut = max(10, int(n * split))
     train_dates = ic_dates[:cut]
@@ -1716,6 +2030,7 @@ def walk_forward(panel, stats, ic_dates, split=0.7, top_k=20, horizon=1,
                 "equal_oos": _summarize_ic_values([], 0),
                 "portfolio": _simulate_topk(panel, {}, [], top_k=top_k, horizon=horizon),
                 "train_dates": len(train_dates), "test_dates": len(test_dates),
+                "folds": [], "oos_folds": _summarize_ic_values([], 0),
                 "note": "训练集没有因子通过筛选，样本外无法评价"}
     oos = _eval_weights(panel, test_dates, weights)
     eq = {k: (1.0 if w > 0 else -1.0) / len(weights) for k, w in weights.items()}
@@ -1723,10 +2038,32 @@ def walk_forward(panel, stats, ic_dates, split=0.7, top_k=20, horizon=1,
     portfolio = _simulate_topk(panel, weights, test_dates,
                                top_k=top_k, horizon=horizon,
                                exclude_limit=exclude_limit)
+    # 多折滚动样本外: 3 段测试窗口均落在后 50%, 训练集逐折扩张,
+    # 用于判断因子组合的样本外表现是否只在某一段行情里偶然有效
+    folds = []
+    fold_ics = []
+    if n >= 30:
+        for f in range(3):
+            lo = int(n * (0.5 + f / 6.0))
+            hi = int(n * (0.5 + (f + 1) / 6.0)) if f < 2 else n
+            tr, te = ic_dates[:lo], ic_dates[lo:hi]
+            if len(tr) < 10 or len(te) < 5:
+                continue
+            tr_stats = summarize_ic(_subset_ic_stats(stats, set(tr)),
+                                    len(tr), len(panel.symbols))
+            fw, _fm = select_weights(panel, tr_stats, tr, **weight_kwargs)
+            if not fw:
+                folds.append({"train": len(tr), "test": len(te), "ic": None})
+                continue
+            ev = _eval_weights(panel, te, fw)
+            folds.append({"train": len(tr), "test": len(te),
+                          "ic": ev.get("mean_ic"), "t": ev.get("t")})
+            fold_ics.extend(ev.get("ics") or [])
+    oos_folds = _summarize_ic_values(fold_ics, n) if fold_ics else _summarize_ic_values([], 0)
     return {"weights": weights, "selected": meta, "sign_map": sign_map,
             "oos": oos, "equal_oos": equal_oos, "portfolio": portfolio,
             "train_dates": len(train_dates), "test_dates": len(test_dates),
-            "note": ""}
+            "folds": folds, "oos_folds": oos_folds, "note": ""}
 
 
 # ---------------------------------------------------------------------------
@@ -1768,6 +2105,7 @@ def score_latest(panel, weights, universe_rows, threshold=None,
     rows = []
     for si, sym in enumerate(panel.symbols):
         total = 0.0
+        abs_total = 0.0
         cov = 0
         cat_sum = {k: 0.0 for k, _ in CATEGORIES}
         cat_abs = {k: 0.0 for k, _ in CATEGORIES}
@@ -1779,17 +2117,17 @@ def score_latest(panel, weights, universe_rows, threshold=None,
             cov += 1
             c = w * (rk - 0.5)
             total += c
+            abs_total += abs(w)
             cat = FACTOR_DEFS[key][1]
             cat_sum[cat] += c
             cat_abs[cat] += abs(w)
             contribs.append((c, key))
-        if cov == 0:
+        if cov == 0 or abs_total <= 0:
             continue
-        score = 50.0 + 50.0 * total
-        cat_scores = {}
-        for cat, _label in CATEGORIES:
-            cat_scores[cat] = (50.0 + 50.0 * cat_sum[cat] / cat_abs[cat]
-                               if cat_abs[cat] > 0 else None)
+        # 原始加权分位(缺失因子已按可用权重归一化); 最终得分再做横截面分位映射
+        comp = total / abs_total
+        cat_comp = {cat: (cat_sum[cat] / cat_abs[cat] if cat_abs[cat] > 0 else None)
+                    for cat, _label in CATEGORIES}
         contribs.sort(key=lambda x: abs(x[0]), reverse=True)
         top = []
         for c, key in contribs[:3]:
@@ -1832,9 +2170,11 @@ def score_latest(panel, weights, universe_rows, threshold=None,
             "pct": pct,
             "amount": u.get("amount"),
             "turnover": u.get("turnover"),
-            "score": score,
+            "score": None,
             "rank": 0,
-            "cat_scores": cat_scores,
+            "cat_scores": {},
+            "_comp": comp,
+            "_cat_comp": cat_comp,
             "top": " ".join(top) if top else "—",
             "coverage": cov / float(len(weights)),
             "ma_dev": ma_dev, "ma_status": ma_status, "ma_above": ma_above,
@@ -1843,12 +2183,35 @@ def score_latest(panel, weights, universe_rows, threshold=None,
             "asof": panel.dates[di],
             "industry": u.get("industry") or u.get("sector") or "…",
         })
-    rows.sort(key=lambda r: r["score"], reverse=True)
+    rows.sort(key=lambda r: r.get("_comp") or -1e18, reverse=True)
+    # 合成值映射为横截面分位得分(0~100): 阈值 85/95 才有明确统计含义
+    if rows:
+        pr = _percentile_rank([r.get("_comp") for r in rows])
+        for r, p in zip(rows, pr):
+            r["score"] = 50.0 if p is None else 100.0 * p
+        for cat, _label in CATEGORIES:
+            pr = _percentile_rank([(r.get("_cat_comp") or {}).get(cat) for r in rows])
+            for r, p in zip(rows, pr):
+                r["cat_scores"][cat] = None if p is None else 100.0 * p
+        for r in rows:
+            r.pop("_comp", None)
+            r.pop("_cat_comp", None)
+        rows.sort(key=lambda r: r["score"], reverse=True)
     for i, r in enumerate(rows):
         r["rank"] = i + 1
     if threshold is not None:
         rows = [r for r in rows if r["score"] >= threshold]
     return rows
+
+
+def _evidence_ok(wf):
+    oos = wf.get("oos") or {}
+    pf = wf.get("portfolio") or {}
+    folds = [f for f in (wf.get("folds") or []) if f.get("ic") is not None]
+    fold_stable = (not folds) or (sum(1 for f in folds if f["ic"] > 0) * 2 >= len(folds))
+    return bool(oos.get("mean_ic") is not None and oos["mean_ic"] > 0
+                and (pf.get("excess") is None or pf["excess"] > 0)
+                and fold_stable)
 
 
 def annotate_advice(rows, wf, vol_cap=0.8):
@@ -1858,8 +2221,10 @@ def annotate_advice(rows, wf, vol_cap=0.8):
     pf = wf.get("portfolio") or {}
     oos_ic = oos.get("mean_ic")
     excess = pf.get("excess")
+    folds = [f for f in (wf.get("folds") or []) if f.get("ic") is not None]
+    fold_stable = (not folds) or (sum(1 for f in folds if f["ic"] > 0) * 2 >= len(folds))
     evidence = (oos_ic is not None and oos_ic > 0
-                and (excess is None or excess > 0))
+                and (excess is None or excess > 0) and fold_stable)
     n = len(rows)
     for r in rows:
         score = r.get("score")
@@ -1869,13 +2234,13 @@ def annotate_advice(rows, wf, vol_cap=0.8):
         label, reason = "观察", "得分中性"
         if score is None or cov < 0.5:
             label, reason = "数据不足", "因子覆盖不足"
-        elif evidence and score >= 75 and pct_rank >= 0.95:
+        elif evidence and score >= 95 and pct_rank >= 0.95:
             label, reason = "强候选", "得分前5% + 样本外正向"
-        elif evidence and score >= 65 and pct_rank >= 0.85:
+        elif evidence and score >= 85 and pct_rank >= 0.85:
             label, reason = "候选", "得分前15% + 样本外正向"
-        elif (not evidence) and score >= 72 and pct_rank >= 0.90:
+        elif (not evidence) and score >= 90 and pct_rank >= 0.90:
             label, reason = "谨慎候选", "得分靠前，但样本外证据不足"
-        elif score >= 55:
+        elif score >= 60:
             label, reason = "观察", "得分中性偏强"
         else:
             label, reason = "回避", "得分偏低"
@@ -2064,10 +2429,7 @@ def run_factor_screen(limit=300, lookback=250, horizon=1, bars_n=320,
         "n_strong": n_strong,
         "n_buy": n_buy,
         "n_caution": n_caution,
-        "evidence_ok": bool((wf.get("oos") or {}).get("mean_ic") is not None
-                            and (wf.get("oos") or {}).get("mean_ic") > 0
-                            and ((wf.get("portfolio") or {}).get("excess") is None
-                                 or (wf.get("portfolio") or {}).get("excess") > 0)),
+        "evidence_ok": _evidence_ok(wf),
         "asof": stocks[0]["asof"] if stocks else (panel.dates[-1] if panel.dates else ""),
         "horizon": horizon,
         "entry_lag": entry_lag,

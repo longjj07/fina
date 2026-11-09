@@ -19,18 +19,24 @@ A股 / 港股 / 美股 桌面看盘 + A股选股器 (零依赖: Python 标准库
 运行:  python stock_monitor.py
 """
 
+import csv
 import importlib.util
 import json
+import logging
 import math
 import os
 import queue
 import shutil
+import socket
 import threading
 import time
 import urllib.request
 import urllib.parse
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor
+
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
 
 try:
     import factor_engine
@@ -77,7 +83,10 @@ OKX_TRADES_URL = "https://www.okx.com/api/v5/market/trades?instId={inst}&limit={
 NASDAQ_SUMMARY_URL = "https://api.nasdaq.com/api/quote/{sym}/summary?assetclass=stocks"
 NASDAQ_HIST_URL = ("https://api.nasdaq.com/api/quote/{sym}/historical?assetclass=stocks"
                    "&fromdate={fromdate}&limit={n}")
-YAHOO_SEARCH_URL = ("https://query1.finance.yahoo.com/v1/finance/search?"
+# Yahoo 接口地址保留为可配置: FINA_YAHOO_BASE 可换成镜像/代理地址
+YAHOO_BASE = os.environ.get("FINA_YAHOO_BASE",
+                            "https://query1.finance.yahoo.com").rstrip("/")
+YAHOO_SEARCH_URL = (YAHOO_BASE + "/v1/finance/search?"
                     "q={sym}&quotesCount=1&newsCount={n}")
 SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SEC_CONCEPT_URL = "https://data.sec.gov/api/xbrl/companyconcept/CIK{cik}/{tax}/{tag}.json"
@@ -121,9 +130,9 @@ EM_INDEX_SECIDS = {
 }
 EM_US_SUFFIX = {105: "OQ", 106: "N", 107: "A"}
 SINA_HQ_URL = "https://hq.sinajs.cn/list={codes}"
-YAHOO_CHART_URL = ("https://query1.finance.yahoo.com/v8/finance/chart/"
+YAHOO_CHART_URL = (YAHOO_BASE + "/v8/finance/chart/"
                    "{sym}?interval=1m&range=1d")
-YAHOO_DAILY_URL = ("https://query1.finance.yahoo.com/v8/finance/chart/"
+YAHOO_DAILY_URL = (YAHOO_BASE + "/v8/finance/chart/"
                    "{sym}?interval=1d&range=6mo")
 _EM_QUOTE_OFF_UNTIL = 0.0
 _EM_TICK_OFF_UNTIL = 0.0
@@ -241,13 +250,15 @@ def fetch_quotes_auto(items):
         if key:
             out[key] = q
     missing = [(k, t) for k, _s, t in items if k not in out]
-    fallback = {"tencent": 0, "yahoo": 0}
+    fallback = {"tencent": 0, "yahoo": 0, "eastmoney": 0}
 
     def fill(it):
         key, tcode = it
-        q = fetch_tencent_quote(tcode)
+        q = fetch_yahoo_quote(tcode[2:]) if tcode.startswith("us") else None
+        if not q:
+            q = fetch_tencent_quote(tcode)
         if not q and tcode.startswith("us"):
-            q = fetch_yahoo_quote(tcode[2:])
+            q = fetch_em_us_quote(tcode[2:])
         return key, q, (q or {}).get("source", "")
 
     if missing:
@@ -259,18 +270,157 @@ def fetch_quotes_auto(items):
                         fallback[src] += 1
     return out, {"sina": len(out) - sum(fallback.values()), **fallback}
 
-# 涨跌配色(默认红涨绿跌, 界面可切换)
-COLOR_UP_DEFAULT = "#d64545"
-COLOR_DOWN_DEFAULT = "#2e9e5b"
-COLOR_FLAT = "#666666"
+
+# 运行错误日志(排查界面/线程异常; 零依赖)
+LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stock_monitor.log")
+_LOG = logging.getLogger("fina")
+_LOG.setLevel(logging.INFO)
+if not _LOG.handlers:
+    try:
+        _lh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+        _lh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        _LOG.addHandler(_lh)
+    except Exception:
+        pass
+
+
+def _log_thread_error(args):
+    _LOG.error("线程未捕获异常", exc_info=(args.exc_type, args.exc_value,
+                                           args.exc_traceback))
+
+
+threading.excepthook = _log_thread_error
+
+# 币安风格深色主题
+BG_ROOT = "#0B0E11"
+BG_PANEL = "#181A20"
+BG_CARD = "#1E2329"
+BG_HOVER = "#2B3139"
+BORDER = "#2B3139"
+FG_TEXT = "#EAECEF"
+FG_MUTED = "#848E9C"
+ACCENT = "#F0B90B"
+ACCENT_HOVER = "#FCD535"
+
+# 涨跌配色(默认红涨绿跌, 界面可切换; 币安红绿)
+COLOR_UP_DEFAULT = "#F6465D"
+COLOR_DOWN_DEFAULT = "#0ECB81"
+COLOR_FLAT = "#848E9C"
 
 
 # ---------------------------------------------------------------------------
 # 基础工具
 # ---------------------------------------------------------------------------
 
+_PROXY_CHECK = {"ts": 0.0, "alive": None}
+_DIRECT_OPENER = None
+_HOST_OK_CACHE = {}
+
+
+def _host_reachable(url, ttl=300.0):
+    """快速判断海外源主机是否可达(1 秒 TCP 探测), 不可达时跳过以避免长超时。"""
+    host = urllib.parse.urlsplit(url).hostname
+    if not host:
+        return False
+    now = time.time()
+    hit = _HOST_OK_CACHE.get(host)
+    if hit and now - hit[0] < ttl:
+        return hit[1]
+    ok = False
+    try:
+        with socket.create_connection((host, 443), timeout=1.0):
+            ok = True
+    except Exception:
+        ok = False
+    _HOST_OK_CACHE[host] = (now, ok)
+    return ok
+
+
+# 海外源熔断: TCP 能连通但 HTTP 403/超时的源, 失败后暂停 10 分钟
+_INTL_STATE = {}
+_INTL_TTL = 600.0
+_INTL_LOCK = threading.Lock()
+
+
+def _intl_ok(name):
+    with _INTL_LOCK:
+        off = _INTL_STATE.get(name, 0.0)
+        return time.time() >= off
+
+
+def _intl_mark(name, ok):
+    with _INTL_LOCK:
+        _INTL_STATE[name] = 0.0 if ok else time.time() + _INTL_TTL
+
+
+# 海外源可用性探测: 访问一次小样本, 失败则本机视为不可用, 10 分钟内直接跳过
+_OVERSEAS_STATE = {}
+_OVERSEAS_PROBES = {
+    "yahoo": YAHOO_BASE + "/v8/finance/chart/SPY?interval=1d&range=1d",
+    "nasdaq": NASDAQ_SUMMARY_URL.format(sym="AAPL"),
+    "sec": "https://data.sec.gov/api/xbrl/companyconcept/CIK0000320193/us-gaap/Revenues.json",
+    "binance": "https://api.binance.com/api/v3/ping",
+    "okx": "https://www.okx.com/api/v5/public/time",
+}
+
+
+def _overseas_ok(name):
+    now = time.time()
+    hit = _OVERSEAS_STATE.get(name)
+    if hit and now - hit[0] < 600:
+        return hit[1]
+    url = _OVERSEAS_PROBES.get(name)
+    ok = False
+    if url:
+        try:
+            _http(url, UA, timeout=3)
+            ok = True
+        except Exception:
+            ok = False
+    _OVERSEAS_STATE[name] = (now, ok)
+    return ok
+
+
+def _proxy_usable():
+    """系统代理存在但进程未运行时返回 False, 改用直连。
+    常见场景: Clash/V2Ray 关闭后 Windows 仍保留 127.0.0.1 代理设置,
+    此时 urllib 会全部 ConnectionRefused, 而直连本身是通的。"""
+    proxies = urllib.request.getproxies()
+    p = proxies.get("https") or proxies.get("http")
+    if not p:
+        return True
+    now = time.time()
+    if _PROXY_CHECK["alive"] is not None and now - _PROXY_CHECK["ts"] < 30:
+        return _PROXY_CHECK["alive"]
+    alive = False
+    try:
+        hostport = p.split("://", 1)[-1].rstrip("/")
+        host, _, port = hostport.partition(":")
+        with socket.create_connection((host, int(port or 80)), timeout=0.8):
+            alive = True
+    except Exception:
+        alive = False
+    _PROXY_CHECK.update(ts=now, alive=alive)
+    return alive
+
+
+_DOMESTIC_HOSTS = ("eastmoney.com", "sinajs.cn", "sina.com.cn",
+                   "gtimg.cn", "qq.com", "iwencai.com")
+
+
+def _is_domestic(url):
+    host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    return any(host == h or host.endswith("." + h) for h in _DOMESTIC_HOSTS)
+
+
 def _http(url, headers, timeout=8):
+    global _DIRECT_OPENER
     req = urllib.request.Request(url, headers=headers)
+    if _is_domestic(url) or not _proxy_usable():
+        if _DIRECT_OPENER is None:
+            _DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with _DIRECT_OPENER.open(req, timeout=timeout) as r:
+            return r.read()
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read()
 
@@ -649,22 +799,23 @@ def fetch_crypto_quotes(raw_symbols):
     out = {}
     if not pairs:
         return out, "binance"
-    try:
-        sym_json = urllib.parse.quote(json.dumps(list(pairs), separators=(",", ":")))
-        raw = _http(BINANCE_TICKER_URL.format(symbols=sym_json), UA, timeout=8)
-        arr = json.loads(raw.decode("utf-8", "replace"))
-        for row in arr if isinstance(arr, list) else []:
-            pair = str(row.get("symbol") or "")
-            source_raw = pairs.get(pair)
-            if not source_raw:
-                continue
-            q = _crypto_quote_from_binance(row, source_raw)
-            if q:
-                out[source_raw] = q
-    except Exception:
-        pass
+    if _overseas_ok("binance"):
+        try:
+            sym_json = urllib.parse.quote(json.dumps(list(pairs), separators=(",", ":")))
+            raw = _http(BINANCE_TICKER_URL.format(symbols=sym_json), UA, timeout=8)
+            arr = json.loads(raw.decode("utf-8", "replace"))
+            for row in arr if isinstance(arr, list) else []:
+                pair = str(row.get("symbol") or "")
+                source_raw = pairs.get(pair)
+                if not source_raw:
+                    continue
+                q = _crypto_quote_from_binance(row, source_raw)
+                if q:
+                    out[source_raw] = q
+        except Exception:
+            pass
     missing = [p for p, raw in pairs.items() if raw not in out]
-    if missing:
+    if missing and _overseas_ok("okx"):
         try:
             raw = _http(OKX_TICKERS_URL, UA, timeout=8)
             data = json.loads(raw.decode("utf-8", "replace"))
@@ -853,7 +1004,8 @@ _YAHOO_NEWS_CACHE = {}
 
 def fetch_nasdaq_summary(sym):
     sym = (sym or "").upper()
-    if not sym:
+    if (not sym or not _host_reachable(NASDAQ_SUMMARY_URL)
+            or not _intl_ok("nasdaq") or not _overseas_ok("nasdaq")):
         return {}
     hit = _NASDAQ_SUMMARY_CACHE.get(sym)
     if hit and time.time() - hit[0] < 300:
@@ -861,7 +1013,7 @@ def fetch_nasdaq_summary(sym):
     try:
         hdr = {"User-Agent": UA["User-Agent"], "Referer": "https://www.nasdaq.com/",
                "Accept": "application/json, text/plain, */*"}
-        raw = _http(NASDAQ_SUMMARY_URL.format(sym=sym), hdr, timeout=10)
+        raw = _http(NASDAQ_SUMMARY_URL.format(sym=sym), hdr, timeout=8)
         sd = (json.loads(raw.decode("utf-8", "replace")).get("data") or {}).get("summaryData") or {}
         low52, high52 = _split_52((sd.get("FiftTwoWeekHighLow") or {}).get("value"))
         out = {
@@ -877,14 +1029,17 @@ def fetch_nasdaq_summary(sym):
             "source": "nasdaq",
         }
         _NASDAQ_SUMMARY_CACHE[sym] = (time.time(), out)
+        _intl_mark("nasdaq", True)
         return out
     except Exception:
+        _intl_mark("nasdaq", False)
         return {}
 
 
 def fetch_nasdaq_daily(sym, n=120):
     sym = (sym or "").upper()
-    if not sym:
+    if (not sym or not _host_reachable(NASDAQ_HIST_URL)
+            or not _intl_ok("nasdaq") or not _overseas_ok("nasdaq")):
         return []
     hit = _NASDAQ_HIST_CACHE.get(sym)
     if hit and time.time() - hit[0] < 300:
@@ -894,7 +1049,7 @@ def fetch_nasdaq_daily(sym, n=120):
                                  time.localtime(time.time() - max(60, n * 2) * 86400))
         hdr = {"User-Agent": UA["User-Agent"], "Referer": "https://www.nasdaq.com/",
                "Accept": "application/json, text/plain, */*"}
-        raw = _http(NASDAQ_HIST_URL.format(sym=sym, fromdate=fromdate, n=n), hdr, timeout=12)
+        raw = _http(NASDAQ_HIST_URL.format(sym=sym, fromdate=fromdate, n=n), hdr, timeout=8)
         rows = (((json.loads(raw.decode("utf-8", "replace")).get("data") or {})
                  .get("tradesTable") or {}).get("rows") or [])
         bars = []
@@ -913,14 +1068,17 @@ def fetch_nasdaq_daily(sym, n=120):
                          "volume": _money(r.get("volume")) or 0})
         bars.sort(key=lambda b: b["date"])
         _NASDAQ_HIST_CACHE[sym] = (time.time(), bars)
+        _intl_mark("nasdaq", True)
         return bars[-n:]
     except Exception:
+        _intl_mark("nasdaq", False)
         return []
 
 
 def fetch_yahoo_news(sym, n=6):
     sym = (sym or "").upper()
-    if not sym:
+    if (not sym or not _host_reachable(YAHOO_SEARCH_URL)
+            or not _intl_ok("yahoo") or not _overseas_ok("yahoo")):
         return []
     hit = _YAHOO_NEWS_CACHE.get(sym)
     if hit and time.time() - hit[0] < 300:
@@ -938,15 +1096,20 @@ def fetch_yahoo_news(sym, n=6):
                         "publisher": str(it.get("publisher") or ""),
                         "impact": classify_announcement(title)})
         _YAHOO_NEWS_CACHE[sym] = (time.time(), out)
+        _intl_mark("yahoo", True)
         return out[:n]
     except Exception:
+        _intl_mark("yahoo", False)
         return []
 
 
 def fetch_yahoo_quote(sym):
     sym = (sym or "").upper().replace(".OQ", "").replace(".N", "").replace(".A", "")
+    if (not _host_reachable(YAHOO_CHART_URL)
+            or not _intl_ok("yahoo") or not _overseas_ok("yahoo")):
+        return None
     try:
-        raw = _http(YAHOO_CHART_URL.format(sym=sym), UA, timeout=10)
+        raw = _http(YAHOO_CHART_URL.format(sym=sym), UA, timeout=8)
         res = ((json.loads(raw.decode("utf-8", "replace")).get("chart") or {})
                .get("result") or [])
         if not res:
@@ -957,7 +1120,7 @@ def fetch_yahoo_quote(sym):
         if price is None:
             return None
         ts = meta.get("regularMarketTime")
-        return {
+        out = {
             "name": meta.get("longName") or meta.get("shortName") or sym,
             "qt_code": sym, "price": price,
             "change": (price - prev) if prev else None,
@@ -970,8 +1133,115 @@ def fetch_yahoo_quote(sym):
             "time": time.strftime("%H:%M:%S", time.localtime(float(ts))) if ts else "",
             "source": "yahoo",
         }
+        _intl_mark("yahoo", True)
+        return out
     except Exception:
+        _intl_mark("yahoo", False)
         return None
+
+
+_EM_US_DETAIL_CACHE = {}
+_EM_US_SECID_CACHE = {}
+_EM_US_QUOTE_CACHE = {}
+EM_US_DETAIL_URL = ("https://push2.eastmoney.com/api/qt/stock/get?secid={secid}"
+                    "&ut=" + EM_UT +
+                    "&fields=f43,f57,f58,f60,f84,f85,f116,f117,f127,f162,f167,"
+                    "f168,f169,f170,f174,f175,f100")
+
+
+def _em_us_secid(code):
+    """美股代码 -> 东财 secid; 依次尝试纳斯达克/纽交所/美交所。"""
+    raw = str(code or "").upper().replace(".", "_")
+    sid = _EM_US_SECID_CACHE.get(raw)
+    if sid:
+        try:
+            raw_b = _http(EM_US_DETAIL_URL.format(secid=sid), EM_HDR, timeout=5)
+            data = json.loads(raw_b.decode("utf-8", "replace")).get("data") or {}
+            if data.get("f57"):
+                return sid, data
+        except Exception:
+            pass
+    for mkt in (105, 106, 107):
+        secid = f"{mkt}.{raw}"
+        try:
+            raw_b = _http(EM_US_DETAIL_URL.format(secid=secid), EM_HDR, timeout=5)
+            data = json.loads(raw_b.decode("utf-8", "replace")).get("data") or {}
+            if data.get("f57"):
+                _EM_US_SECID_CACHE[raw] = secid
+                return secid, data
+        except Exception:
+            continue
+    return None, {}
+
+
+def fetch_em_us_quote(code):
+    """东方财富美股快照(国内直连), 用于腾讯/海外源不可达时的自选行情。"""
+    key = str(code or "").upper()
+    hit = _EM_US_QUOTE_CACHE.get(key)
+    if hit and time.time() - hit[0] < 10:
+        return dict(hit[1])
+    _secid, d = _em_us_secid(key)
+    if not d:
+        return None
+
+    def px(v):
+        v = _raw_float(v)
+        return v / 1000.0 if v is not None else None
+
+    price = px(d.get("f43"))
+    if price is None or price <= 0:
+        return None
+    pct = _raw_float(d.get("f170"))
+    out = {
+        "name": d.get("f58") or key,
+        "qt_code": d.get("f57") or key,
+        "price": price,
+        "change": px(d.get("f169")),
+        "pct": pct / 100.0 if pct is not None else None,
+        "open": px(d.get("f46")),
+        "high": px(d.get("f44")),
+        "low": px(d.get("f45")),
+        "prev_close": px(d.get("f60")),
+        "volume": _raw_float(d.get("f47"), 0),
+        "time": time.strftime("%H:%M:%S"),
+        "source": "eastmoney",
+    }
+    _EM_US_QUOTE_CACHE[key] = (time.time(), dict(out))
+    return out
+
+
+def fetch_em_us_fundamentals(code):
+    """东方财富美股基本面(国内直连), 作为 Nasdaq/SEC 不可达时的替代。"""
+    code = (code or "").upper()
+    hit = _EM_US_DETAIL_CACHE.get(code)
+    if hit and time.time() - hit[0] < 600:
+        return hit[1]
+    secid, d = _em_us_secid(code)
+    if not secid:
+        _EM_US_DETAIL_CACHE[code] = (time.time(), {})
+        return {}
+
+    def px(v):
+        v = _raw_float(v)
+        return v / 1000.0 if v else None
+
+    pb = _raw_float(d.get("f167"))
+    out = {
+        "pb": pb / 100.0 if pb and pb > 0 else None,
+        "mktcap": (_raw_float(d.get("f116")) or 0) / 1e8 or None,
+        "turnover": (_raw_float(d.get("f168")) or 0) / 100.0 or None,
+        "high52": px(d.get("f174")),
+        "low52": px(d.get("f175")),
+        "prev_close": px(d.get("f60")),
+        "industry": (d.get("f127") or d.get("f100")
+                     if (d.get("f127") or d.get("f100")) not in (None, "-") else None),
+        "name": d.get("f58"),
+        "secid": secid,
+        "source": "eastmoney",
+    }
+    out = {k: v for k, v in out.items() if v is not None}
+    _EM_US_DETAIL_CACHE[code] = (time.time(), out)
+    return out
 
 
 _SEC_CIK = None
@@ -988,13 +1258,17 @@ def _sec_cik_map():
         with open(_SEC_CIK_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception:
-        try:
-            raw = _http(SEC_TICKERS_URL, SEC_UA, timeout=20)
-            data = json.loads(raw.decode("utf-8", "replace"))
-            with open(_SEC_CIK_FILE, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
-        except Exception:
+        if (not _host_reachable(SEC_TICKERS_URL)
+                or not _intl_ok("sec") or not _overseas_ok("sec")):
             data = {}
+        else:
+            try:
+                raw = _http(SEC_TICKERS_URL, SEC_UA, timeout=20)
+                data = json.loads(raw.decode("utf-8", "replace"))
+                with open(_SEC_CIK_FILE, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
+            except Exception:
+                data = {}
     out = {}
     for v in (data or {}).values():
         try:
@@ -1020,9 +1294,11 @@ def _sec_annual(vals, unit):
 
 
 def _sec_concept(cik, tax, tag):
+    if not _intl_ok("sec") or not _overseas_ok("sec"):
+        return {}
     try:
         raw = _http(SEC_CONCEPT_URL.format(cik=cik, tax=tax, tag=tag),
-                    SEC_UA, timeout=15)
+                    SEC_UA, timeout=6)
         return json.loads(raw.decode("utf-8", "replace")).get("units") or {}
     except Exception:
         return {}
@@ -1030,6 +1306,9 @@ def _sec_concept(cik, tax, tag):
 
 def fetch_sec_fundamentals(sym):
     sym = (sym or "").upper()
+    if (not _host_reachable(SEC_CONCEPT_URL)
+            or not _intl_ok("sec") or not _overseas_ok("sec")):
+        return {}
     hit = _SEC_FUND_CACHE.get(sym)
     if hit and time.time() - hit[0] < 3600:
         return hit[1]
@@ -1078,6 +1357,7 @@ def fetch_sec_fundamentals(sym):
     if out.get("net_income") and out.get("equity"):
         out["roe"] = out["net_income"] / out["equity"]
     _SEC_FUND_CACHE[sym] = (time.time(), out)
+    _intl_mark("sec", bool(got and any(got.values())))
     return out
 
 
@@ -1223,7 +1503,20 @@ def _yahoo_symbol(code):
 
 
 def _fetch_yahoo_daily(symbol, n=12):
-    """腾讯/新浪日K均失败时的美股/港股日K兜底。"""
+    """美股复用 factor_engine 的 Yahoo 日K(与因子选股同源); 港股用本地解析。"""
+    tick = _us_ticker(symbol)
+    if tick and factor_engine is not None:
+        try:
+            bars = factor_engine.fetch_us_bars(tick, max(int(n), 12))
+            if bars:
+                return [{"date": b[0], "open": b[1], "close": b[2],
+                         "high": b[3], "low": b[4], "volume": b[5]}
+                        for b in bars]
+        except Exception:
+            pass
+    if (not _host_reachable(YAHOO_DAILY_URL)
+            or not _intl_ok("yahoo") or not _overseas_ok("yahoo")):
+        return []
     sym = _yahoo_symbol(symbol)
     if not sym:
         return []
@@ -1262,6 +1555,9 @@ def _fetch_yahoo_daily(symbol, n=12):
 
 def _fetch_yahoo_minutes(code, n=60):
     """港股/美股逐笔不可得时的 1 分钟分时兜底。"""
+    if (not _host_reachable(YAHOO_CHART_URL)
+            or not _intl_ok("yahoo") or not _overseas_ok("yahoo")):
+        return []
     sym = _yahoo_symbol(code)
     if not sym:
         return []
@@ -1354,7 +1650,8 @@ def fetch_screen_universe(market="a", f_min=0.0, limit=800):
                 "pct": r.get("pct"),
                 "amount": r.get("amount"),
                 "volume": r.get("volume"),
-                "turnover": None,
+                "turnover": r.get("hs"),
+                "lb": r.get("lb"),
                 "high": r.get("high"),
                 "low": r.get("low"),
                 "open": r.get("open"),
@@ -1999,12 +2296,22 @@ def collect_evaluation(code, quote=None, factor_row=None):
                 bvps = sec["equity"] / sec["shares"]
                 if bvps > 0 and fund.get("pb") is None:
                     fund["pb"] = pr / bvps
+            # 国内直连回退: 东财美股详情补 PB/市值/换手/52周/行业
+            emf = fetch_em_us_fundamentals(tick)
+            for k in ("pb", "mktcap", "turnover", "high52", "low52",
+                      "prev_close", "industry"):
+                if emf.get(k) is not None and fund.get(k) is None:
+                    fund[k] = emf[k]
+            if emf.get("name") and not (quote or {}).get("name"):
+                fund["name"] = emf["name"]
     industry = ""
     if mkt in ("sh", "sz", "bj") and not etf:
         try:
             industry = fetch_industry(tcode)
         except Exception:
             industry = ""
+    if not industry:
+        industry = fund.get("industry") or fund.get("sector") or ""
     news, nstats = [], {"n_pos": 0, "n_neg": 0}
     if mkt in ("sh", "sz", "bj", "hk", "us"):
         try:
@@ -2428,6 +2735,8 @@ def _patch_pywencai_headers():
     global _PYWENCAI_PATCHED
     if _PYWENCAI_PATCHED:
         return
+    # pywencai 通过 Node 生成 token; 屏蔽 Node 的 punycode 弃用警告
+    os.environ.setdefault("NODE_OPTIONS", "--no-deprecation")
     import pywencai.wencai as _wc_mod
     _orig = _wc_mod.headers
 
@@ -2541,6 +2850,25 @@ def _wc_code_of(value):
 # 主窗口
 # ---------------------------------------------------------------------------
 
+def export_rows_csv(parent, title, default_name, headers, rows):
+    """弹出保存对话框并写 UTF-8-BOM CSV(Excel 直接打开不乱码)。"""
+    path = filedialog.asksaveasfilename(
+        parent=parent, title=title, defaultextension=".csv",
+        initialfile=default_name,
+        filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")])
+    if not path:
+        return ""
+    try:
+        with open(path, "w", encoding="utf-8-sig", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(headers)
+            w.writerows(rows)
+    except Exception as e:
+        messagebox.showerror("导出失败", str(e), parent=parent)
+        return ""
+    return path
+
+
 class FlowFrame(ttk.Frame):
     """按可用宽度自动换行的控件容器。"""
 
@@ -2653,6 +2981,15 @@ class StockMonitorApp:
         self.root.after(300, self._factor_pump)
         self.root.after(350, self._eval_pump)
         root.protocol("WM_DELETE_WINDOW", self._on_close)
+        root.report_callback_exception = self._on_ui_error
+
+    def _on_ui_error(self, exc, val, tb):
+        _LOG.error("界面回调异常", exc_info=(exc, val, tb))
+        try:
+            messagebox.showerror("运行错误", f"{exc.__name__}: {val}",
+                                 parent=self.root)
+        except Exception:
+            pass
 
     # ---------------- 配置 ----------------
     def _load_config(self):
@@ -2745,9 +3082,96 @@ class StockMonitorApp:
         return COLOR_DOWN_DEFAULT, COLOR_UP_DEFAULT
 
     # ---------------- UI 骨架 ----------------
+    def _apply_theme(self, style):
+        """币安风格深色主题: #0B0E11 底 + #F0B90B 强调色。"""
+        style.theme_use("clam")
+        self.root.configure(bg=BG_ROOT)
+        self.root.option_add("*TCombobox*Listbox.background", BG_CARD)
+        self.root.option_add("*TCombobox*Listbox.foreground", FG_TEXT)
+        self.root.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
+        self.root.option_add("*TCombobox*Listbox.selectForeground", BG_ROOT)
+        style.configure(".", background=BG_ROOT, foreground=FG_TEXT,
+                        fieldbackground=BG_CARD, bordercolor=BORDER,
+                        lightcolor=BG_PANEL, darkcolor=BG_PANEL,
+                        troughcolor=BG_PANEL, focuscolor=ACCENT,
+                        font=("Microsoft YaHei", 9))
+        style.configure("TFrame", background=BG_ROOT)
+        style.configure("Card.TFrame", background=BG_PANEL)
+        style.configure("TLabel", background=BG_ROOT, foreground=FG_TEXT)
+        style.configure("Muted.TLabel", background=BG_ROOT, foreground=FG_MUTED)
+        style.configure("TButton", background=BG_CARD, foreground=FG_TEXT,
+                        bordercolor=BORDER, focuscolor=BG_CARD,
+                        padding=(10, 4), relief="flat")
+        style.map("TButton",
+                  background=[("active", BG_HOVER), ("disabled", BG_PANEL)],
+                  foreground=[("disabled", FG_MUTED)])
+        style.configure("Accent.TButton", background=ACCENT, foreground="#0B0E11",
+                        bordercolor=ACCENT, focuscolor=ACCENT,
+                        font=("Microsoft YaHei", 9, "bold"))
+        style.map("Accent.TButton",
+                  background=[("active", ACCENT_HOVER), ("disabled", "#5E4E0C")],
+                  foreground=[("disabled", "#B8A15A")])
+        style.configure("TEntry", fieldbackground=BG_CARD, foreground=FG_TEXT,
+                        insertcolor=FG_TEXT, bordercolor=BORDER,
+                        lightcolor=BG_CARD, darkcolor=BG_CARD, padding=3)
+        style.map("TEntry", bordercolor=[("focus", ACCENT)])
+        style.configure("TCombobox", fieldbackground=BG_CARD, background=BG_CARD,
+                        foreground=FG_TEXT, arrowcolor=FG_MUTED,
+                        bordercolor=BORDER, padding=3)
+        style.map("TCombobox",
+                  fieldbackground=[("readonly", BG_CARD)],
+                  foreground=[("readonly", FG_TEXT)],
+                  selectbackground=[("readonly", BG_CARD)],
+                  selectforeground=[("readonly", FG_TEXT)],
+                  arrowcolor=[("active", ACCENT)])
+        style.configure("TSpinbox", fieldbackground=BG_CARD, foreground=FG_TEXT,
+                        arrowcolor=FG_MUTED, bordercolor=BORDER)
+        style.configure("TCheckbutton", background=BG_ROOT, foreground=FG_TEXT,
+                        indicatorcolor=BG_CARD, focuscolor=BG_ROOT)
+        style.map("TCheckbutton",
+                  background=[("active", BG_ROOT)],
+                  foreground=[("active", FG_TEXT)],
+                  indicatorcolor=[("selected", ACCENT)])
+        style.configure("TNotebook", background=BG_ROOT, bordercolor=BORDER,
+                        tabmargins=(8, 6, 8, 0))
+        style.configure("TNotebook.Tab", background=BG_PANEL, foreground=FG_MUTED,
+                        padding=(18, 8), bordercolor=BORDER)
+        style.map("TNotebook.Tab",
+                  background=[("selected", BG_CARD), ("active", BG_HOVER)],
+                  foreground=[("selected", ACCENT), ("active", FG_TEXT)])
+        style.configure("Treeview", background=BG_PANEL, fieldbackground=BG_PANEL,
+                        foreground=FG_TEXT, bordercolor=BORDER, rowheight=25,
+                        font=("Microsoft YaHei", 9))
+        style.map("Treeview",
+                  background=[("selected", BG_HOVER)],
+                  foreground=[("selected", FG_TEXT)])
+        style.configure("Treeview.Heading", background=BG_CARD, foreground=FG_MUTED,
+                        bordercolor=BORDER, relief="flat",
+                        font=("Microsoft YaHei", 9, "bold"), padding=(4, 6))
+        style.map("Treeview.Heading",
+                  background=[("active", BG_HOVER)],
+                  foreground=[("active", FG_TEXT)])
+        style.configure("Vertical.TScrollbar", background=BG_CARD, troughcolor=BG_ROOT,
+                        arrowcolor=FG_MUTED, bordercolor=BG_ROOT)
+        style.configure("Horizontal.TScrollbar", background=BG_CARD, troughcolor=BG_ROOT,
+                        arrowcolor=FG_MUTED, bordercolor=BG_ROOT)
+        style.configure("TLabelframe", background=BG_ROOT, foreground=FG_MUTED,
+                        bordercolor=BORDER)
+        style.configure("TLabelframe.Label", background=BG_ROOT, foreground=FG_MUTED)
+        style.configure("TPanedwindow", background=BG_ROOT)
+        style.configure("TPanedwindow.Sash", background=BORDER)
+
     def _build_ui(self):
         style = ttk.Style()
-        style.theme_use("clam")
+        self._apply_theme(style)
+        hdr = ttk.Frame(self.root, padding=(16, 8, 16, 2))
+        hdr.pack(fill="x")
+        ttk.Label(hdr, text="FINA", font=("Segoe UI", 15, "bold"),
+                  foreground=ACCENT).pack(side="left")
+        ttk.Label(hdr, text="  行情监控 · 选股 · 因子研究",
+                  foreground=FG_MUTED).pack(side="left")
+        ttk.Label(hdr, text="延时行情 · 仅供研究，不构成投资建议",
+                  foreground=FG_MUTED).pack(side="right")
         nb = ttk.Notebook(self.root)
         nb.pack(fill="both", expand=True)
         self.nb = nb
@@ -2795,7 +3219,8 @@ class StockMonitorApp:
         entry = ttk.Entry(ctrl, textvariable=self.add_var, width=30)
         entry.pack(side="left", padx=4)
         entry.bind("<Return>", lambda e: self._add_symbols())
-        ttk.Button(ctrl, text="添加", command=self._add_symbols).pack(side="left", padx=2)
+        ttk.Button(ctrl, text="添加", command=self._add_symbols,
+                   style="Accent.TButton").pack(side="left", padx=2)
         ttk.Button(ctrl, text="删除选中", command=self._remove_selected).pack(side="left", padx=2)
         ttk.Button(ctrl, text="立即刷新", command=self._refresh_now).pack(side="left", padx=2)
         ttk.Label(ctrl, text="  刷新间隔(秒):").pack(side="left")
@@ -2848,6 +3273,7 @@ class StockMonitorApp:
                 self._queue.put(res)
             except Exception as e:
                 print("抓取异常:", e)
+                _LOG.exception("自选行情抓取异常")
             self._refresh_event.wait(timeout=self.interval)
             self._refresh_event.clear()
 
@@ -2909,7 +3335,9 @@ class StockMonitorApp:
                 indexes[name] = data
         return {"stocks": stocks, "indexes": indexes,
                 "source": f"新浪批量 {sources['sina']} · 腾讯回退 {sources['tencent']}"
-                          f" · Yahoo {sources.get('yahoo', 0)} · 加密 {len(crypto_quotes)}"}
+                          f" · Yahoo {sources.get('yahoo', 0)}"
+                          f" · 东财 {sources.get('eastmoney', 0)}"
+                          f" · 加密 {len(crypto_quotes)}"}
 
     def _poll(self):
         try:
@@ -3099,12 +3527,13 @@ class StockMonitorApp:
             values=("量比", "换手率", "涨跌幅", "昨涨幅", "涨幅差", "连涨",
                     "24h消息", "买入信号", "成交额", "开盘倾向")))
 
-        self.screen_btn = add(ttk.Button(top, text="查询",
+        self.screen_btn = add(ttk.Button(top, text="查询", style="Accent.TButton",
                                          command=self._run_screen), padx=6)
         self.screen_wencai_btn = add(ttk.Button(top, text="转问财",
                                                 command=self._screen_to_wencai))
+        add(ttk.Button(top, text="导出CSV", command=self._export_screen_csv))
         self.screen_count_var = tk.StringVar(value="点击「查询」开始筛选")
-        add(ttk.Label(top, textvariable=self.screen_count_var, foreground="#333"),
+        add(ttk.Label(top, textvariable=self.screen_count_var, foreground=FG_MUTED),
             padx=(10, 0))
 
         # 第二行: 当日 vs 昨日 对比条件(量化筛股)
@@ -3127,7 +3556,7 @@ class StockMonitorApp:
         ttk.Checkbutton(top2, text="仅看24h有利好", variable=self.f_news_var).pack(side="left", padx=4)
         self.f_signal_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(top2, text="仅看买入候选(≥3项共振)", variable=self.f_signal_var).pack(side="left", padx=4)
-        ttk.Label(top2, text="· 留空/不勾 = 不限", foreground="#888").pack(side="left", padx=6)
+        ttk.Label(top2, text="· 留空/不勾 = 不限", foreground=FG_MUTED).pack(side="left", padx=6)
 
         # 结果表格
         cols = ("code", "name", "industry", "price", "pct", "pct_prev", "delta", "streak",
@@ -3154,8 +3583,8 @@ class StockMonitorApp:
         self.stree.tag_configure("down", foreground=COLOR_DOWN_DEFAULT)
         self.stree.tag_configure("flat", foreground=COLOR_FLAT)
         # 买入候选行背景高亮(与涨跌前景色叠加: 多标签各管各的选项)
-        self.stree.tag_configure("sig3", background="#fff2a6")   # 候选(3项共振) 浅黄
-        self.stree.tag_configure("sig4", background="#ffd24d")   # 强候选(4项) 黄
+        self.stree.tag_configure("sig3", background="#3A2F0B", foreground=ACCENT_HOVER)   # 候选(3项共振)
+        self.stree.tag_configure("sig4", background="#5E4E0C", foreground=ACCENT_HOVER)   # 强候选(4项)
         self.stree.bind("<Double-1>", self._open_screen_detail)
         self.stree.bind("<Button-3>", self._on_screen_right_click)
 
@@ -3176,7 +3605,7 @@ class StockMonitorApp:
         ttk.Entry(pg, textvariable=self.goto_var, width=5).pack(side="left")
         ttk.Button(pg, text="跳转", command=self._screen_goto).pack(side="left", padx=2)
         ttk.Label(pg, text="黄底=买入候选 · 条件(4项共振): 倾向≥60 / 涨幅加速 / 连涨≥2 / 24h无利空",
-                  foreground="#999").pack(side="left", padx=14)
+                  foreground=FG_MUTED).pack(side="left", padx=14)
         self._screen_market_changed()
 
     def _screen_market_changed(self):
@@ -3302,8 +3731,10 @@ class StockMonitorApp:
                             list(ex.map(enrich, missing))
                 else:
                     for r in cands:
-                        r["lb"] = 0.0
-                        r["hs"] = to_float(r.get("turnover")) or 0.0
+                        if r.get("lb") is None:
+                            r["lb"] = 0.0
+                        if r.get("hs") is None:
+                            r["hs"] = to_float(r.get("turnover")) or 0.0
                 # 第三段: 日K补齐「昨日」指标(昨涨幅/连涨/昨日量比, 当日缓存), 供对比过滤与打分
                 self._screen_queue.put(("status",
                                         f"正在抓取日K对比昨涨幅... ({len(cands)} 只)"))
@@ -3405,6 +3836,7 @@ class StockMonitorApp:
                 self._screen_queue.put(("deliver", rows, True))
             except Exception as e:
                 err = str(e)
+                _LOG.exception("选股器查询失败")
                 self._screen_queue.put(("deliver", [], True))
                 self._screen_queue.put(("status", f"查询失败: {err}"))
 
@@ -3481,6 +3913,29 @@ class StockMonitorApp:
             )
             self.stree.insert("", "end", values=vals, tags=tags)
         self.page_var.set(f"第 {self.screen_page + 1} / {pages} 页")
+
+    def _export_screen_csv(self):
+        rows = getattr(self, "screen_rows", [])
+        if not rows:
+            messagebox.showinfo("导出", "当前没有筛选结果，请先查询", parent=self.root)
+            return
+        headers = ["代码", "名称", "行业", "现价", "涨跌幅%", "昨涨幅%", "涨幅差",
+                   "连涨", "24h利好", "24h利空", "量比", "换手率%", "成交额",
+                   "成交量", "开盘倾向", "倾向标签", "买入信号"]
+        data = [[
+            r.get("code"), r.get("name"), r.get("industry"),
+            r.get("price"), r.get("pct"), r.get("pct_prev"), r.get("delta"),
+            r.get("streak"), r.get("news_pos"), r.get("news_neg"),
+            r.get("lb"), r.get("hs"), r.get("amount"), r.get("volume"),
+            r.get("bias"), r.get("bias_label"), r.get("signal"),
+        ] for r in rows]
+        mkt = {"a": "A股", "us": "美股", "etf": "ETF"}.get(
+            getattr(self, "screen_market", "a"), "a")
+        path = export_rows_csv(
+            self.root, "导出选股结果",
+            f"screen_{mkt}_{time.strftime('%Y%m%d_%H%M')}.csv", headers, data)
+        if path:
+            self.screen_count_var.set(f"已导出 {len(data)} 行 → {path}")
 
     def _screen_sort_value(self, r, col):
         """选股器行某列的可排序值; None 表示缺失(排最后)。"""
@@ -3613,7 +4068,9 @@ class StockMonitorApp:
         self.root.update()
 
     def _show_context_menu(self, event, code):
-        menu = tk.Menu(self.root, tearoff=0)
+        menu = tk.Menu(self.root, tearoff=0, bg=BG_CARD, fg=FG_TEXT,
+                       activebackground=BG_HOVER, activeforeground=ACCENT,
+                       bd=0, relief="flat")
         menu.add_command(label=f"复制代码 {code}", command=lambda: self._copy_code(code))
         menu.add_command(label="查看分笔成交", command=lambda: self._open_ticks(code))
         menu.add_command(label="综合评分/买入区间", command=lambda: self._open_evaluation(code))
@@ -3665,6 +4122,7 @@ class StockMonitorApp:
                 break
 
         win = tk.Toplevel(self.root)
+        win.configure(bg=BG_ROOT)
         win.title(f"综合评估 - {c[1]}")
         win.geometry("780x700")
         win.transient(self.root)
@@ -3674,12 +4132,14 @@ class StockMonitorApp:
         ttk.Label(hdr, text=f"{c[1]} 综合评估",
                   font=("Microsoft YaHei", 11, "bold")).pack(side="left")
         status_var = tk.StringVar(value="分析中...")
-        ttk.Label(hdr, textvariable=status_var, foreground="#666").pack(side="right")
+        ttk.Label(hdr, textvariable=status_var, foreground=FG_MUTED).pack(side="right")
 
         tf = ttk.Frame(win, padding=(8, 4))
         tf.pack(fill="both", expand=True)
         text = tk.Text(tf, wrap="word", font=("Microsoft YaHei", 9),
-                       background="#fbfbfb", relief="flat", padx=10, pady=8)
+                       background=BG_PANEL, foreground=FG_TEXT, insertbackground=FG_TEXT,
+                       relief="flat", padx=10, pady=8, selectbackground=ACCENT,
+                       selectforeground=BG_ROOT)
         vsb = ttk.Scrollbar(tf, orient="vertical", command=text.yview)
         text.configure(yscrollcommand=vsb.set)
         text.pack(side="left", fill="both", expand=True)
@@ -3687,8 +4147,8 @@ class StockMonitorApp:
         text.tag_configure("h", font=("Microsoft YaHei", 11, "bold"), spacing1=10, spacing3=4)
         text.tag_configure("buy", foreground=COLOR_UP_DEFAULT)
         text.tag_configure("sell", foreground=COLOR_DOWN_DEFAULT)
-        text.tag_configure("warn", foreground="#b36b00")
-        text.tag_configure("muted", foreground="#666666")
+        text.tag_configure("warn", foreground=ACCENT)
+        text.tag_configure("muted", foreground=FG_MUTED)
         text.configure(state="disabled")
 
         btns = ttk.Frame(win, padding=(8, 4))
@@ -3698,7 +4158,7 @@ class StockMonitorApp:
         copy_btn = ttk.Button(btns, text="复制报告",
                               command=lambda: self._copy_text(text.get("1.0", "end").strip()))
         copy_btn.pack(side="left", padx=6)
-        ttk.Label(btns, text="研究参考，不构成投资建议", foreground="#999").pack(side="right")
+        ttk.Label(btns, text="研究参考，不构成投资建议", foreground=FG_MUTED).pack(side="right")
 
         q = queue.Queue()
         state = {"closed": False, "busy": False, "pump": None}
@@ -3774,6 +4234,7 @@ class StockMonitorApp:
         _tcode, disp, _mkt = c
         pf = fmt_crypto_price if _mkt == "cr" else fmt_price
         win = tk.Toplevel(self.root)
+        win.configure(bg=BG_ROOT)
         win.title(f"分笔/分时 - {disp}")
         win.geometry("620x560")
         win.transient(self.root)
@@ -3783,7 +4244,7 @@ class StockMonitorApp:
         ttk.Label(hdr, text=f"{disp} 分笔/分时 · 自动刷新 5 秒",
                   font=("Microsoft YaHei", 10, "bold")).pack(side="left")
         source_var = tk.StringVar(value="加载中...")
-        ttk.Label(hdr, textvariable=source_var, foreground="#666").pack(side="right")
+        ttk.Label(hdr, textvariable=source_var, foreground=FG_MUTED).pack(side="right")
 
         cols = ("time", "price", "volume", "direction")
         headers = ("时间", "价格", "量", "方向")
@@ -3803,7 +4264,7 @@ class StockMonitorApp:
         tree.tag_configure("sell", foreground=COLOR_DOWN_DEFAULT)
         tree.tag_configure("flat", foreground=COLOR_FLAT)
         ttk.Label(win, text="量为数据源原始单位（A股通常为手）；仅作行情参考，不构成投资建议",
-                  foreground="#999").pack(anchor="w", padx=10, pady=(0, 6))
+                  foreground=FG_MUTED).pack(anchor="w", padx=10, pady=(0, 6))
 
         state = {"closed": False, "after": None, "pump": None}
         tick_q = queue.Queue()
@@ -3872,6 +4333,7 @@ class StockMonitorApp:
         disp = c[1]
 
         win = tk.Toplevel(self.root)
+        win.configure(bg=BG_ROOT)
         win.title(f"公告消息 - {disp}")
         win.geometry("760x540")
         win.transient(self.root)
@@ -3881,7 +4343,7 @@ class StockMonitorApp:
         ttk.Label(hdr, text=f"{disp} 基本面公告 · 利好/利空为关键词启发式标注",
                   font=("Microsoft YaHei", 10, "bold")).pack(side="left")
         status = tk.StringVar(value="加载中...")
-        ttk.Label(hdr, textvariable=status, foreground="#666").pack(side="right")
+        ttk.Label(hdr, textvariable=status, foreground=FG_MUTED).pack(side="right")
 
         tf = ttk.Frame(win, padding=(8, 4))
         tf.pack(fill="both", expand=True)
@@ -3977,6 +4439,7 @@ class StockMonitorApp:
             qt_code = entry[0].get("qt_code") or ""
 
         win = tk.Toplevel(self.root)
+        win.configure(bg=BG_ROOT)
         win.title(f"24h消息面 - {disp}")
         win.geometry("880x560")
         win.transient(self.root)
@@ -3986,7 +4449,7 @@ class StockMonitorApp:
         ttk.Label(hdr, text=f"{disp} 近24小时资讯 · 利好/利空为关键词启发式标注",
                   font=("Microsoft YaHei", 10, "bold")).pack(side="left")
         status = tk.StringVar(value="加载中...")
-        ttk.Label(hdr, textvariable=status, foreground="#666").pack(side="right")
+        ttk.Label(hdr, textvariable=status, foreground=FG_MUTED).pack(side="right")
 
         tf = ttk.Frame(win, padding=(8, 4))
         tf.pack(fill="both", expand=True)
@@ -4049,7 +4512,8 @@ class StockMonitorApp:
         ent = ttk.Entry(top, textvariable=self.eval_code_var, width=14)
         ent.pack(side="left", padx=2)
         ent.bind("<Return>", lambda e: self._run_eval_tab())
-        self.eval_btn = ttk.Button(top, text="评估", command=self._run_eval_tab)
+        self.eval_btn = ttk.Button(top, text="评估", command=self._run_eval_tab,
+                                   style="Accent.TButton")
         self.eval_btn.pack(side="left", padx=6)
         ttk.Button(top, text="复制报告", command=self._copy_eval_report).pack(side="left", padx=2)
         for code in ("AAPL", "600519", "510300", "BTC"):
@@ -4058,12 +4522,14 @@ class StockMonitorApp:
         self.eval_status_var = tk.StringVar(
             value="支持 美股 / A股 / 港股 / ETF / 加密货币；输入代码后回车或点评估")
         ttk.Label(self.tab_eval, textvariable=self.eval_status_var,
-                  foreground="#666", padding=(8, 2)).pack(fill="x")
+                  foreground=FG_MUTED, padding=(8, 2)).pack(fill="x")
 
         tf = ttk.Frame(self.tab_eval, padding=(8, 4))
         tf.pack(fill="both", expand=True)
         self.eval_text = tk.Text(tf, wrap="word", font=("Microsoft YaHei", 9),
-                                 background="#fbfbfb", relief="flat", padx=12, pady=10)
+                                 background=BG_PANEL, foreground=FG_TEXT, insertbackground=FG_TEXT,
+                                 relief="flat", padx=12, pady=10,
+                                 selectbackground=ACCENT, selectforeground=BG_ROOT)
         vsb = ttk.Scrollbar(tf, orient="vertical", command=self.eval_text.yview)
         self.eval_text.configure(yscrollcommand=vsb.set)
         self.eval_text.pack(side="left", fill="both", expand=True)
@@ -4072,8 +4538,8 @@ class StockMonitorApp:
                                      spacing1=12, spacing3=4)
         self.eval_text.tag_configure("buy", foreground=COLOR_UP_DEFAULT)
         self.eval_text.tag_configure("sell", foreground=COLOR_DOWN_DEFAULT)
-        self.eval_text.tag_configure("warn", foreground="#b36b00")
-        self.eval_text.tag_configure("muted", foreground="#666666")
+        self.eval_text.tag_configure("warn", foreground=ACCENT)
+        self.eval_text.tag_configure("muted", foreground=FG_MUTED)
         self.eval_text.configure(state="disabled")
         if self._eval_last_lines:
             self._render_eval_tab_lines(self._eval_last_lines)
@@ -4202,21 +4668,22 @@ class StockMonitorApp:
         add(ttk.Label(top, text="得分≥"))
         self.factor_threshold_var = tk.StringVar(value=f"{self.factor_threshold:g}")
         add(ttk.Entry(top, textvariable=self.factor_threshold_var, width=5))
-        self.factor_run_btn = add(ttk.Button(top, text="运行",
+        self.factor_run_btn = add(ttk.Button(top, text="运行", style="Accent.TButton",
                                              command=self._run_factor), padx=6)
         self.factor_cancel_btn = add(ttk.Button(top, text="取消",
                                                 command=self._factor_cancel_cmd,
                                                 state="disabled"))
         add(ttk.Button(top, text="评价选中", command=self._eval_selected_factor))
         add(ttk.Button(top, text="量能回测", command=self._show_volume_analysis))
+        add(ttk.Button(top, text="导出CSV", command=self._export_factor_csv))
 
         info = ttk.Frame(self.tab_factor, padding=(8, 0))
         info.pack(fill="x")
         self.factor_status_var = tk.StringVar(
             value="点击「运行」: 抓取成交额前 N 只日K, 计算 RankIC/ICIR 并做样本外检验")
-        ttk.Label(info, textvariable=self.factor_status_var, foreground="#333").pack(side="left")
+        ttk.Label(info, textvariable=self.factor_status_var, foreground=FG_MUTED).pack(side="left")
         ttk.Label(info, text="次日建议为研究候选 · 样本外证据不足时自动降级 · 不构成投资建议",
-                  foreground="#999").pack(side="right")
+                  foreground=FG_MUTED).pack(side="right")
 
         paned = ttk.Panedwindow(self.tab_factor, orient="vertical")
         paned.pack(fill="both", expand=True, padx=8, pady=(4, 6))
@@ -4239,8 +4706,8 @@ class StockMonitorApp:
         self.fstats_tree.configure(yscrollcommand=fsb.set)
         self.fstats_tree.pack(side="left", fill="both", expand=True)
         fsb.pack(side="right", fill="y")
-        self.fstats_tree.tag_configure("sel", background="#eef7ee")
-        self.fstats_tree.tag_configure("off", foreground="#888")
+        self.fstats_tree.tag_configure("sel", background="#123A2A")
+        self.fstats_tree.tag_configure("off", foreground=FG_MUTED)
         paned.add(sf, weight=1)
 
         rf = ttk.LabelFrame(paned, text="筛选结果 (按因子得分排序)", padding=(4, 2))
@@ -4251,7 +4718,7 @@ class StockMonitorApp:
         ttk.Combobox(rf_top, textvariable=self.factor_show_var, width=5, state="readonly",
                      values=("20", "50", "100")).pack(side="left", padx=2)
         ttk.Label(rf_top, text="只 · 点击表头排序 · 双击打开详情 · 右键复制/资讯/公告",
-                  foreground="#999").pack(side="left", padx=6)
+                  foreground=FG_MUTED).pack(side="left", padx=6)
         self.factor_show_var.trace_add("write", lambda *a: self._render_factor_results())
         self.factor_buy_only_var.trace_add("write", lambda *a: self._render_factor_results())
 
@@ -4284,11 +4751,11 @@ class StockMonitorApp:
         self.factor_tree.tag_configure("up", foreground=COLOR_UP_DEFAULT)
         self.factor_tree.tag_configure("down", foreground=COLOR_DOWN_DEFAULT)
         self.factor_tree.tag_configure("flat", foreground=COLOR_FLAT)
-        self.factor_tree.tag_configure("hot", background="#eef7ee")
-        self.factor_tree.tag_configure("adv_strong", background="#ffd24d")
-        self.factor_tree.tag_configure("adv_buy", background="#fff2a6")
-        self.factor_tree.tag_configure("adv_caution", background="#e8f4ff")
-        self.factor_tree.tag_configure("adv_avoid", background="#eeeeee")
+        self.factor_tree.tag_configure("hot", background="#123A2A")
+        self.factor_tree.tag_configure("adv_strong", background="#5E4E0C")
+        self.factor_tree.tag_configure("adv_buy", background="#3A2F0B")
+        self.factor_tree.tag_configure("adv_caution", background="#132A3E")
+        self.factor_tree.tag_configure("adv_avoid", background="#2B1C1E")
         self.factor_tree.bind("<Double-1>", self._open_factor_detail)
         self.factor_tree.bind("<Button-3>", self._on_factor_right_click)
         paned.add(rf, weight=3)
@@ -4450,6 +4917,7 @@ class StockMonitorApp:
         self._start_factor_industry_fill()
 
     def _factor_error(self, msg):
+        _LOG.warning("因子选股失败: %s", msg)
         self._factor_busy = False
         self.factor_run_btn.configure(state="normal")
         self.factor_cancel_btn.configure(state="disabled")
@@ -4475,6 +4943,10 @@ class StockMonitorApp:
         parts.append(f"次日买入候选 {n_buy}（强 {n_strong}，谨慎 {n_caution}）")
         if oos is not None:
             parts.append(f"样本外IC {oos:+.3f}")
+        folds = [f for f in (wf.get("folds") or []) if f.get("ic") is not None]
+        if folds:
+            pos = sum(1 for f in folds if f["ic"] > 0)
+            parts.append(f"滚动折 {pos}/{len(folds)} 正")
         if eq is not None:
             parts.append(f"等权基准 {eq:+.3f}")
         pf = wf.get("portfolio") or {}
@@ -4496,21 +4968,24 @@ class StockMonitorApp:
             messagebox.showinfo("提示", "请先运行一次因子选股，再查看量能回测")
             return
         win = tk.Toplevel(self.root)
+        win.configure(bg=BG_ROOT)
         win.title("量能回测 · 当日量/前2日量")
         win.geometry("760x620")
         win.transient(self.root)
         tf = ttk.Frame(win, padding=(8, 6))
         tf.pack(fill="both", expand=True)
         text = tk.Text(tf, wrap="word", font=("Consolas", 9),
-                       background="#fbfbfb", relief="flat", padx=10, pady=8)
+                       background=BG_PANEL, foreground=FG_TEXT, insertbackground=FG_TEXT,
+                       relief="flat", padx=10, pady=8, selectbackground=ACCENT,
+                       selectforeground=BG_ROOT)
         vsb = ttk.Scrollbar(tf, orient="vertical", command=text.yview)
         text.configure(yscrollcommand=vsb.set)
         text.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
         text.tag_configure("h", font=("Microsoft YaHei", 11, "bold"), spacing1=10)
         text.tag_configure("buy", foreground=COLOR_UP_DEFAULT)
-        text.tag_configure("muted", foreground="#666666")
-        text.tag_configure("warn", foreground="#b36b00")
+        text.tag_configure("muted", foreground=FG_MUTED)
+        text.tag_configure("warn", foreground=ACCENT)
         lines = []
         add = lambda tag, line: lines.append((tag, line))
         add("h", "量能回测：当日成交量 / 前2日成交量")
@@ -4803,6 +5278,35 @@ class StockMonitorApp:
             )
             self.factor_tree.insert("", "end", values=vals, tags=tags)
 
+    def _export_factor_csv(self):
+        rows = getattr(self, "factor_rows", [])
+        if not rows:
+            messagebox.showinfo("导出", "当前没有因子选股结果，请先运行", parent=self.root)
+            return
+        headers = ["排名", "代码", "名称", "市场", "现价", "涨跌幅%", "因子得分",
+                   "均线", "量/前2日", "次日建议", "模型证据", "动量", "趋势",
+                   "波动", "流动性", "形态", "市场分", "主要贡献", "行业", "数据日"]
+        mkt_label = {"a": "A股", "etf": "ETF", "us": "美股", "crypto": "加密"}
+        data = []
+        for r in sorted(rows, key=lambda x: x.get("score") or -1, reverse=True):
+            cat = r.get("cat_scores") or {}
+            data.append([
+                r.get("rank"), r.get("code"), r.get("name"),
+                mkt_label.get(r.get("market"), r.get("market")),
+                r.get("price"), r.get("pct"), r.get("score"),
+                r.get("ma_status"), r.get("vol_prev2"),
+                r.get("advice"), r.get("evidence"),
+                cat.get("momentum"), cat.get("trend"), cat.get("volatility"),
+                cat.get("liquidity"), cat.get("pattern"), cat.get("market"),
+                r.get("top"), r.get("industry"), r.get("asof"),
+            ])
+        mkt = getattr(self, "factor_market", "all")
+        path = export_rows_csv(
+            self.root, "导出因子选股结果",
+            f"factor_{mkt}_{time.strftime('%Y%m%d_%H%M')}.csv", headers, data)
+        if path:
+            self.factor_status_var.set(f"已导出 {len(data)} 行 → {path}")
+
     def _open_factor_detail(self, _event):
         sel = self.factor_tree.selection()
         if not sel:
@@ -4836,7 +5340,7 @@ class StockMonitorApp:
         ent.pack(side="left", padx=4)
         ent.bind("<KeyRelease>", lambda e: self._render_feed())
         self.feed_status_var = tk.StringVar(value="加载中...")
-        ttk.Label(ctrl, textvariable=self.feed_status_var, foreground="#666").pack(side="right")
+        ttk.Label(ctrl, textvariable=self.feed_status_var, foreground=FG_MUTED).pack(side="right")
 
         tf = ttk.Frame(self.tab_feed, padding=(8, 4))
         tf.pack(fill="both", expand=True)
@@ -4927,7 +5431,7 @@ class StockMonitorApp:
         cb.pack(side="left")
         cb.bind("<<ComboboxSelected>>", lambda e: self.wencai_query_var.set(cb.get()))
         self.wencai_status_var = tk.StringVar()
-        ttk.Label(top, textvariable=self.wencai_status_var, foreground="#333").pack(side="left", padx=8)
+        ttk.Label(top, textvariable=self.wencai_status_var, foreground=FG_MUTED).pack(side="left", padx=8)
 
         top2 = ttk.Frame(self.tab_wencai, padding=(8, 0))
         top2.pack(fill="x")
@@ -4935,7 +5439,7 @@ class StockMonitorApp:
         self.wencai_cookie_var = tk.StringVar(value=self.wencai_cookie)
         ttk.Entry(top2, textvariable=self.wencai_cookie_var, width=66).pack(side="left", padx=4)
         ttk.Label(top2, text="浏览器打开 www.iwencai.com → F12 → 控制台执行 document.cookie → 复制粘贴(本地保存)",
-                  foreground="#888").pack(side="left", padx=4)
+                  foreground=FG_MUTED).pack(side="left", padx=4)
 
         tf = ttk.Frame(self.tab_wencai, padding=(8, 4))
         tf.pack(fill="both", expand=True)
