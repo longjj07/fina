@@ -372,11 +372,13 @@ def _overseas_ok(name):
     url = _OVERSEAS_PROBES.get(name)
     ok = False
     if url:
-        try:
-            _http(url, UA, timeout=3)
-            ok = True
-        except Exception:
-            ok = False
+        for _ in range(2):
+            try:
+                _http(url, UA, timeout=4)
+                ok = True
+                break
+            except Exception:
+                ok = False
     _OVERSEAS_STATE[name] = (now, ok)
     return ok
 
@@ -1105,6 +1107,7 @@ def fetch_yahoo_news(sym, n=6):
 
 def fetch_yahoo_quote(sym):
     sym = (sym or "").upper().replace(".OQ", "").replace(".N", "").replace(".A", "")
+    sym = sym.replace(".", "-")
     if (not _host_reachable(YAHOO_CHART_URL)
             or not _intl_ok("yahoo") or not _overseas_ok("yahoo")):
         return None

@@ -467,7 +467,8 @@ pip install pywencai        # 会带装 pandas/requests 等
 > python stock_monitor.py
 > ```
 >
-> 默认 `FINA_US_SOURCE=yahoo`（Yahoo 优先）；设为 `em` 可强制东财直连。
+> 无需根据代理开关改配置：有代理时自动走代理访问 Yahoo；Yahoo 不可达时（无论代理开/关）
+> 自动切东财，10 分钟内不重复探测。`FINA_US_SOURCE=em` 仅用于强制东财优先。
 > Yahoo/Nasdaq 连续失败后会熔断 10 分钟，期间自动使用东财，不会反复等待超时。
 > 加密货币仍依赖 Binance/OKX，若两者均不可达则该市场暂不可用。
 

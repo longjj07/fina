@@ -601,6 +601,29 @@ def _src_mark(name, ok):
             _SRC_STATE[name] = [fails, time.time() + _SRC_TTL if fails >= 2 else off]
 
 
+_YAHOO_PROBE = {"ts": 0.0, "ok": None}
+
+
+def _yahoo_probe():
+    """探测 Yahoo 是否真的可用(代理开/关都适用); 两次失败才熔断 10 分钟。"""
+    now = time.time()
+    if _YAHOO_PROBE["ok"] is not None and now - _YAHOO_PROBE["ts"] < _SRC_TTL:
+        return _YAHOO_PROBE["ok"]
+    ok = False
+    for _ in range(2):
+        try:
+            _http(YAHOO_BASE + "/v8/finance/chart/SPY?interval=1d&range=1d",
+                  UA, timeout=4)
+            ok = True
+            break
+        except Exception:
+            ok = False
+    _YAHOO_PROBE.update(ts=now, ok=ok)
+    with _SRC_LOCK:
+        _SRC_STATE["yahoo"] = [0, 0.0] if ok else [2, now + _SRC_TTL]
+    return ok
+
+
 # 美股 code -> 东财市场号(105=纳斯达克,106=纽交所,107=美交所)
 _EM_US_MARKET = {}
 
@@ -722,7 +745,7 @@ def _fetch_em_index_bars(n=320):
 
 
 def _yahoo_screener_rows(start, count=250):
-    if not _src_ok("yahoo"):
+    if not _yahoo_probe() or not _src_ok("yahoo"):
         return []
     hdr = {"User-Agent": UA["User-Agent"],
            "Accept": "application/json, text/plain, */*"}
@@ -839,7 +862,7 @@ def fetch_us_universe(limit=150):
 
 
 def _yahoo_daily_bars(sym, n=320):
-    if not _src_ok("yahoo"):
+    if not _yahoo_probe() or not _src_ok("yahoo"):
         return []
     url_sym = urllib.parse.quote(str(sym).replace(".", "-"), safe="")
     rng = "6mo" if n <= 60 else "2y"
