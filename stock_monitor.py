@@ -1924,6 +1924,85 @@ def fetch_industry(symbol):
 
 
 # ---------------------------------------------------------------------------
+# 板块概念(东财「所属板块」): 行业/概念/地域板块 + 当日板块涨幅
+# ---------------------------------------------------------------------------
+
+EM_SLIST_URL = ("https://push2.eastmoney.com/api/qt/slist/get?spt=3&fltt=2&invt=2"
+                "&secid={secid}&pn=1&pz=100&fields=f12,f13,f14,f3")
+_CONCEPT_CACHE = {}
+_CONCEPT_FAIL = {}
+_CONCEPT_TTL = 86400.0
+_CONCEPT_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "concept_cache.json")
+
+
+def _load_concept_cache():
+    try:
+        with open(_CONCEPT_CACHE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        now = time.time()
+        for k, v in data.items():
+            if k.startswith("_"):
+                continue
+            if isinstance(v, dict) and now - float(v.get("ts") or 0) < 7 * 86400:
+                _CONCEPT_CACHE[k] = v
+    except Exception:
+        pass
+
+
+def _save_concept_cache():
+    try:
+        with open(_CONCEPT_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(_CONCEPT_CACHE, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def fetch_concepts(symbol):
+    """A股/ETF 所属板块概念: [{code,name,pct}]。非 A 股返回 []。"""
+    c = classify_symbol(symbol)
+    if not c or c[2] not in ("sh", "sz", "bj"):
+        return []
+    tcode, disp, mkt = c
+    now = time.time()
+    hit = _CONCEPT_CACHE.get(tcode)
+    if hit and now - float(hit.get("ts") or 0) < _CONCEPT_TTL:
+        return hit.get("items") or []
+    fail = _CONCEPT_FAIL.get(tcode)
+    if fail and now - fail < 600:
+        return []
+    try:
+        secid = ("1." if mkt == "sh" else "0.") + disp
+        raw = _http(EM_SLIST_URL.format(secid=secid), EM_HDR, timeout=6)
+        data = json.loads(raw.decode("utf-8", "replace")).get("data") or {}
+        diff = data.get("diff") or {}
+        rows = list(diff.values()) if isinstance(diff, dict) else diff
+        items = []
+        seen = set()
+        for r in rows:
+            name = str(r.get("f14") or "").strip()
+            code = str(r.get("f12") or "")
+            if not name or not code.startswith("BK") or name in seen:
+                continue
+            seen.add(name)
+            items.append({"code": code, "name": name,
+                          "pct": to_float(r.get("f3"))})
+        _CONCEPT_CACHE[tcode] = {"ts": now, "items": items}
+        return items
+    except Exception:
+        _CONCEPT_FAIL[tcode] = now
+        return []
+
+
+def concepts_text(items, n=3):
+    """概念列表 -> 表格单行摘要(取前 n 个)。"""
+    names = [x.get("name") for x in (items or []) if x.get("name")]
+    if not names:
+        return "—"
+    return "·".join(names[:n]) + ("…" if len(names) > n else "")
+
+
+# ---------------------------------------------------------------------------
 # 开盘倾向: 横截面多因子打分 (量化选股)
 # ---------------------------------------------------------------------------
 # 把原「启发式单指标」升级为「多因子横截面打分」:
@@ -2315,6 +2394,7 @@ def collect_evaluation(code, quote=None, factor_row=None):
             industry = ""
     if not industry:
         industry = fund.get("industry") or fund.get("sector") or ""
+    concepts = fetch_concepts(tcode) if mkt in ("sh", "sz", "bj") else []
     news, nstats = [], {"n_pos": 0, "n_neg": 0}
     if mkt in ("sh", "sz", "bj", "hk", "us"):
         try:
@@ -2429,6 +2509,7 @@ def collect_evaluation(code, quote=None, factor_row=None):
         "quote": quote or {}, "tech": tech, "fund": fund, "asof": asof,
         "news": news, "nstats": nstats, "factor": factor_row,
         "industry": industry,
+        "concepts": concepts,
         "score": round(score), "label": label, "action": action,
     }
 
@@ -2503,6 +2584,11 @@ def format_evaluation(ev):
                 bits.append(f"平均量 {fmt_vol(f['avg_volume'])}")
             add("muted", "  ·  ".join(bits))
 
+    conc = ev.get("concepts") or []
+    if conc:
+        shown = " · ".join(x.get("name") or "" for x in conc[:12])
+        more = f" …共 {len(conc)} 个" if len(conc) > 12 else ""
+        add("muted", f"板块概念：{shown}{more}")
     add("h", "消息面（近24h）")
     ns = ev.get("nstats") or {}
     if ev["mkt"] == "cr":
@@ -3235,11 +3321,11 @@ class StockMonitorApp:
                         command=self._toggle_color).pack(side="left", padx=10)
 
         # 表格
-        cols = ("mkt", "code", "name", "price", "change", "pct", "pct_prev", "delta",
+        cols = ("mkt", "code", "name", "concept", "price", "change", "pct", "pct_prev", "delta",
                 "open", "high", "low", "prev", "volume", "time")
-        headers = ("市场", "代码", "名称", "现价", "涨跌", "涨跌幅", "昨涨幅", "涨幅差",
+        headers = ("市场", "代码", "名称", "概念/板块", "现价", "涨跌", "涨跌幅", "昨涨幅", "涨幅差",
                    "开盘", "最高", "最低", "昨收", "成交量", "更新时间")
-        widths = (48, 76, 112, 82, 82, 82, 76, 76, 78, 78, 78, 78, 90, 140)
+        widths = (48, 76, 108, 190, 82, 82, 82, 76, 76, 78, 78, 78, 78, 90, 128)
         self.watch_cols = cols
         self.watch_headers = dict(zip(cols, headers))
         tf = ttk.Frame(self.tab_watch, padding=(8, 4))
@@ -3248,7 +3334,7 @@ class StockMonitorApp:
         for c, h, w in zip(cols, headers, widths):
             self.tree.heading(c, text=h, command=lambda col=c: self._sort_watch(col))
             self.tree.column(c, width=w, anchor="e")
-        for c in ("name", "code", "mkt"):
+        for c in ("name", "code", "mkt", "concept"):
             self.tree.column(c, anchor="w")
         self.tree.column("time", anchor="center")
         vsb = ttk.Scrollbar(tf, orient="vertical", command=self.tree.yview)
@@ -3329,6 +3415,27 @@ class StockMonitorApp:
                     if data and m and m.get("p") is not None and data[0].get("pct") is not None:
                         data[0]["pct_prev"] = m["p"]
                         data[0]["delta"] = round(data[0]["pct"] - m["p"], 2)
+
+        # 板块概念(A股/ETF, 磁盘缓存; 首次抓取后基本不再请求)
+        def attach_conc(sym):
+            items = fetch_concepts(sym)
+            return sym, items
+
+        conc_syms = []
+        for sym in stocks:
+            c = classify_symbol(sym)
+            if c and c[2] in ("sh", "sz", "bj"):
+                conc_syms.append(sym)
+        if conc_syms:
+            with ThreadPoolExecutor(max_workers=16) as ex:
+                for sym, items in ex.map(attach_conc, conc_syms):
+                    data = stocks.get(sym)
+                    if data:
+                        txt = concepts_text(items)
+                        if txt == "—" and is_etf(sym):
+                            txt = "ETF"
+                        data[0]["concepts"] = items
+                        data[0]["concepts_text"] = txt
         stocks = {k: tuple(v) for k, v in stocks.items()}
 
         indexes = {}
@@ -3385,7 +3492,7 @@ class StockMonitorApp:
             if not entry or entry[0] is None:
                 self.tree.insert("", "end", values=(
                     MARKET_LABEL.get(mkt, "?"), sym, "--", "--", "--", "--", "--",
-                    "--", "--", "--", "--", "获取失败"), tags=("flat",))
+                    "--", "--", "--", "--", "--", "获取失败"), tags=("flat",))
                 continue
             d, _ = entry
             chg = d.get("change") or 0
@@ -3402,6 +3509,7 @@ class StockMonitorApp:
                 "ETF/LOF" if etf else MARKET_LABEL.get(mkt, "?"),
                 sym,
                 d.get("name") or "",
+                d.get("concepts_text") or "—",
                 pf(d.get("price")),
                 sf(d.get("change")),
                 fmt_pct(d.get("pct")),
@@ -3562,11 +3670,12 @@ class StockMonitorApp:
         ttk.Label(top2, text="· 留空/不勾 = 不限", foreground=FG_MUTED).pack(side="left", padx=6)
 
         # 结果表格
-        cols = ("code", "name", "industry", "price", "pct", "pct_prev", "delta", "streak",
-                "news", "lb", "hs", "amount", "volume", "bias", "signal")
-        headers = ("代码", "名称", "行业", "现价", "涨跌幅", "昨涨幅", "涨幅差", "连涨",
-                   "24h消息", "量比", "换手率", "成交额", "成交量", "开盘倾向", "买入信号")
-        widths = (72, 100, 88, 76, 76, 72, 72, 48, 104, 60, 72, 88, 88, 92, 84)
+        cols = ("code", "name", "industry", "concept", "price", "pct", "pct_prev",
+                "delta", "streak", "news", "lb", "hs", "amount", "volume", "bias", "signal")
+        headers = ("代码", "名称", "行业", "概念/板块", "现价", "涨跌幅", "昨涨幅",
+                   "涨幅差", "连涨", "24h消息", "量比", "换手率", "成交额", "成交量",
+                   "开盘倾向", "买入信号")
+        widths = (72, 100, 76, 170, 76, 76, 72, 72, 48, 96, 60, 72, 80, 84, 92, 84)
         self.screen_cols = cols
         self.screen_headers = dict(zip(cols, headers))
         tf = ttk.Frame(self.tab_screen, padding=(8, 4))
@@ -3578,6 +3687,7 @@ class StockMonitorApp:
         self.stree.column("name", anchor="w")
         self.stree.column("code", anchor="w")
         self.stree.column("industry", anchor="w")
+        self.stree.column("concept", anchor="w")
         svsb = ttk.Scrollbar(tf, orient="vertical", command=self.stree.yview)
         self.stree.configure(yscrollcommand=svsb.set)
         self.stree.pack(side="left", fill="both", expand=True)
@@ -3828,7 +3938,8 @@ class StockMonitorApp:
                 # 第三段: 补齐行业(带缓存), 完成后更新
                 if rows:
                     def add_industry(row):
-                        if row.get("market") in ("us", "etf") or                                 row.get("industry") not in ("", "…", None):
+                        if (row.get("market") in ("us", "etf")
+                                or row.get("industry") not in ("", "…", None)):
                             if not row.get("industry"):
                                 row["industry"] = "—"
                             return row
@@ -3836,6 +3947,20 @@ class StockMonitorApp:
                         return row
                     with ThreadPoolExecutor(max_workers=16) as ex:
                         rows = list(ex.map(add_industry, rows))
+
+                    def add_concepts(row):
+                        c = classify_symbol(row.get("symbol"))
+                        if c and c[2] in ("sh", "sz", "bj"):
+                            txt = concepts_text(fetch_concepts(row.get("symbol")))
+                            if txt == "—":
+                                txt = row.get("industry") or "—"
+                            row["concepts_text"] = txt
+                        else:
+                            row["concepts_text"] = row.get("industry") or "—"
+                        return row
+                    with ThreadPoolExecutor(max_workers=16) as ex:
+                        rows = list(ex.map(add_concepts, rows))
+                    _save_concept_cache()
                 self._screen_queue.put(("deliver", rows, True))
             except Exception as e:
                 err = str(e)
@@ -3901,6 +4026,7 @@ class StockMonitorApp:
                 r["code"],
                 r["name"] or "",
                 r.get("industry") or "—",
+                r.get("concepts_text") or "—",
                 fmt_price(r.get("price")),
                 fmt_pct(r.get("pct")),
                 fmt_pct(r.get("pct_prev")),
@@ -3922,11 +4048,12 @@ class StockMonitorApp:
         if not rows:
             messagebox.showinfo("导出", "当前没有筛选结果，请先查询", parent=self.root)
             return
-        headers = ["代码", "名称", "行业", "现价", "涨跌幅%", "昨涨幅%", "涨幅差",
-                   "连涨", "24h利好", "24h利空", "量比", "换手率%", "成交额",
-                   "成交量", "开盘倾向", "倾向标签", "买入信号"]
+        headers = ["代码", "名称", "行业", "概念/板块", "现价", "涨跌幅%",
+                   "昨涨幅%", "涨幅差", "连涨", "24h利好", "24h利空", "量比",
+                   "换手率%", "成交额", "成交量", "开盘倾向", "倾向标签", "买入信号"]
         data = [[
             r.get("code"), r.get("name"), r.get("industry"),
+            r.get("concepts_text"),
             r.get("price"), r.get("pct"), r.get("pct_prev"), r.get("delta"),
             r.get("streak"), r.get("news_pos"), r.get("news_neg"),
             r.get("lb"), r.get("hs"), r.get("amount"), r.get("volume"),
@@ -4075,6 +4202,7 @@ class StockMonitorApp:
                        activebackground=BG_HOVER, activeforeground=ACCENT,
                        bd=0, relief="flat")
         menu.add_command(label=f"复制代码 {code}", command=lambda: self._copy_code(code))
+        menu.add_command(label="查看板块概念", command=lambda: self._open_concepts(code))
         menu.add_command(label="查看分笔成交", command=lambda: self._open_ticks(code))
         menu.add_command(label="综合评分/买入区间", command=lambda: self._open_evaluation(code))
         c = classify_symbol(code)
@@ -4109,6 +4237,63 @@ class StockMonitorApp:
         self._show_context_menu(event, code)
 
     # ---------------- 综合评估弹窗 ----------------
+    def _open_concepts(self, code):
+        c = classify_symbol(code)
+        if not c:
+            messagebox.showinfo("板块概念", "无法识别该代码", parent=self.root)
+            return
+        _tcode, disp, mkt = c
+        win = tk.Toplevel(self.root)
+        win.configure(bg=BG_ROOT)
+        win.title(f"板块概念 - {disp}")
+        win.geometry("560x480")
+        hdr = ttk.Frame(win, padding=(10, 8))
+        hdr.pack(fill="x")
+        ttk.Label(hdr, text=f"{disp} 所属板块",
+                  font=("Microsoft YaHei", 11, "bold")).pack(side="left")
+        status = tk.StringVar(value="加载中...")
+        ttk.Label(hdr, textvariable=status, foreground=FG_MUTED).pack(side="right")
+
+        tf = ttk.Frame(win, padding=(10, 2))
+        tf.pack(fill="both", expand=True)
+        cols = ("name", "code", "pct")
+        headers = ("板块/概念", "板块代码", "今日涨跌幅")
+        widths = (260, 100, 100)
+        tree = ttk.Treeview(tf, columns=cols, show="headings")
+        for col, h, w in zip(cols, headers, widths):
+            tree.heading(col, text=h)
+            tree.column(col, width=w, anchor="e" if col == "pct" else "w")
+        vsb = ttk.Scrollbar(tf, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        tree.tag_configure("up", foreground=COLOR_UP_DEFAULT)
+        tree.tag_configure("down", foreground=COLOR_DOWN_DEFAULT)
+        tree.tag_configure("flat", foreground=COLOR_FLAT)
+        ttk.Label(win, text="双击板块打开东方财富板块行情 · 概念为关键词归类，不构成投资建议",
+                  foreground=FG_MUTED, padding=(10, 4)).pack(fill="x")
+
+        items = fetch_concepts(code)
+        if not items:
+            status.set("暂无板块数据" if mkt in ("sh", "sz", "bj")
+                       else "仅支持 A股/ETF，海外股票见综合评估行业")
+        else:
+            status.set(f"共 {len(items)} 个板块 · 东方财富")
+            for it in items:
+                pct = it.get("pct")
+                tag = "flat" if not pct else ("up" if pct > 0 else "down")
+                tree.insert("", "end", values=(it.get("name"), it.get("code"),
+                                               fmt_pct(pct)), tags=(tag,))
+
+        def open_board(_e):
+            sel = tree.selection()
+            if not sel:
+                return
+            vals = tree.item(sel[0], "values")
+            if len(vals) >= 2 and str(vals[1]).startswith("BK"):
+                webbrowser.open(f"https://quote.eastmoney.com/bk/90.{vals[1]}.html")
+        tree.bind("<Double-1>", open_board)
+
     def _open_evaluation(self, code):
         c = classify_symbol(code)
         if not c:
@@ -4727,12 +4912,12 @@ class StockMonitorApp:
 
         rcols = ("rank", "code", "name", "price", "pct", "score", "ma", "vol2",
                  "advice", "evidence", "mom", "trend", "vol", "liq",
-                 "pattern", "market", "top", "industry", "asof")
+                 "pattern", "market", "top", "industry", "concept", "asof")
         rheaders = ("排名", "代码", "名称", "现价", "涨跌幅", "因子得分", "均线", "量/前2日",
                     "次日建议", "模型证据", "动量", "趋势", "波动", "流动性",
-                    "形态", "市场", "主要贡献", "行业", "数据日")
+                    "形态", "市场", "主要贡献", "行业", "概念/板块", "数据日")
         rwidths = (44, 66, 96, 70, 68, 62, 92, 76, 84, 62, 50, 50, 50, 54,
-                   50, 50, 200, 78, 78)
+                   50, 50, 190, 78, 190, 78)
         self.factor_cols = rcols
         self.factor_headers = dict(zip(rcols, rheaders))
         rbox = ttk.Frame(rf)
@@ -4741,7 +4926,7 @@ class StockMonitorApp:
         for c, h, w in zip(rcols, rheaders, rwidths):
             self.factor_tree.heading(c, text=h, command=lambda col=c: self._sort_factor_results(col))
             self.factor_tree.column(c, width=w, anchor="e")
-        for c in ("code", "name", "top", "industry"):
+        for c in ("code", "name", "top", "industry", "concept"):
             self.factor_tree.column(c, anchor="w")
         rysb = ttk.Scrollbar(rbox, orient="vertical", command=self.factor_tree.yview)
         rxsb = ttk.Scrollbar(rbox, orient="horizontal", command=self.factor_tree.xview)
@@ -4891,6 +5076,8 @@ class StockMonitorApp:
                     self._factor_cancelled()
                 elif kind == "industry":
                     self._factor_apply_industry(item[1])
+                elif kind == "concept":
+                    self._factor_apply_concepts(item[1])
         except queue.Empty:
             pass
         try:
@@ -5044,21 +5231,32 @@ class StockMonitorApp:
 
         def work():
             mapping = {}
+            cmap = {}
 
             def one(r):
+                sym = r.get("symbol")
                 ind = r.get("industry")
-                if ind not in (None, "", "…", "—"):
-                    return r.get("symbol"), ind
-                try:
-                    return r.get("symbol"), fetch_industry(r.get("symbol"))
-                except Exception:
-                    return r.get("symbol"), "—"
+                if ind in (None, "", "…", "—"):
+                    try:
+                        ind = fetch_industry(sym)
+                    except Exception:
+                        ind = "—"
+                c = classify_symbol(sym or "")
+                if c and c[2] in ("sh", "sz", "bj"):
+                    ctext = concepts_text(fetch_concepts(sym))
+                    if ctext == "—":
+                        ctext = ind if ind not in (None, "", "…", "—") else "—"
+                else:
+                    ctext = ind if ind not in (None, "", "…", "—") else "—"
+                return sym, ind, ctext
 
             with ThreadPoolExecutor(max_workers=12) as ex:
-                for sym, ind in ex.map(one, rows):
+                for sym, ind, ctext in ex.map(one, rows):
                     if sym:
                         mapping[sym] = ind
+                        cmap[sym] = ctext
             self._factor_queue.put(("industry", mapping))
+            self._factor_queue.put(("concept", cmap))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -5070,6 +5268,16 @@ class StockMonitorApp:
             if ind:
                 r["industry"] = ind
         _save_industry_cache()
+        self._render_factor_results()
+
+    def _factor_apply_concepts(self, mapping):
+        if not mapping:
+            return
+        for r in self.factor_rows:
+            txt = mapping.get(r.get("symbol"))
+            if txt:
+                r["concepts_text"] = txt
+        _save_concept_cache()
         self._render_factor_results()
 
     def _factor_stat_sort_value(self, r, col):
@@ -5277,6 +5485,7 @@ class StockMonitorApp:
             ) + tuple(cat_text(r, k) for _c, k in cat_keys) + (
                 r.get("top") or "—",
                 r.get("industry") or "—",
+                r.get("concepts_text") or "…",
                 r.get("asof") or "—",
             )
             self.factor_tree.insert("", "end", values=vals, tags=tags)
@@ -5288,7 +5497,8 @@ class StockMonitorApp:
             return
         headers = ["排名", "代码", "名称", "市场", "现价", "涨跌幅%", "因子得分",
                    "均线", "量/前2日", "次日建议", "模型证据", "动量", "趋势",
-                   "波动", "流动性", "形态", "市场分", "主要贡献", "行业", "数据日"]
+                   "波动", "流动性", "形态", "市场分", "主要贡献", "行业",
+                   "概念/板块", "数据日"]
         mkt_label = {"a": "A股", "etf": "ETF", "us": "美股", "crypto": "加密"}
         data = []
         for r in sorted(rows, key=lambda x: x.get("score") or -1, reverse=True):
@@ -5301,7 +5511,8 @@ class StockMonitorApp:
                 r.get("advice"), r.get("evidence"),
                 cat.get("momentum"), cat.get("trend"), cat.get("volatility"),
                 cat.get("liquidity"), cat.get("pattern"), cat.get("market"),
-                r.get("top"), r.get("industry"), r.get("asof"),
+                r.get("top"), r.get("industry"), r.get("concepts_text"),
+                r.get("asof"),
             ])
         mkt = getattr(self, "factor_market", "all")
         path = export_rows_csv(
@@ -5620,12 +5831,14 @@ class StockMonitorApp:
         self._sync_factor_settings()
         self._save_config()
         _save_industry_cache()
+        _save_concept_cache()
         _save_kline_cache()
         self.root.destroy()
 
 
 def main():
     _load_industry_cache()
+    _load_concept_cache()
     _load_kline_cache()
     root = tk.Tk()
     app = StockMonitorApp(root)
